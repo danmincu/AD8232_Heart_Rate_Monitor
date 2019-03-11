@@ -22,7 +22,7 @@ Version History
 ---------------
 * [v10](https://github.com/sparkfun/AD8232_Heart_Rate_Monitor/tree/v10) Initial Release
 
-changed the Processing PDE file to output better charts see 
+* [v11] changed the Processing PDE file to output better charts see 
 [![example](https://github.com/danmincu/AD8232_Heart_Rate_Monitor/blob/master/ECG-Dan-0001.png)](https://github.com/danmincu/AD8232_Heart_Rate_Monitor/blob/master/ECG-Dan-0001.png)
 
 License Information
