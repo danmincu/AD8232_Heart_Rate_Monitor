@@ -770,7 +770,7 @@ function drawGrid(){
   var x;
   for(x = 0; x < w; x += 40){
     var vmaj = (x % 200 === 0);
-    g.strokeStyle = vmaj ? "rgba(0,0,0,0.50)" : "rgba(0,0,255,0.22)";
+    g.strokeStyle = vmaj ? "rgba(220,80,80,0.40)" : "rgba(255,150,150,0.35)";
     g.lineWidth   = vmaj ? 1.0 : 0.5;
     g.beginPath(); g.moveTo(x + 0.5, 0); g.lineTo(x + 0.5, h); g.stroke();
   }
@@ -783,7 +783,7 @@ function drawGrid(){
     for(var oi = 0; oi < offsets.length; oi++){
       var y = midY + offsets[oi];
       if(y < 0 || y > h) continue;
-      g.strokeStyle = hmaj ? "rgba(0,0,0,0.50)" : "rgba(0,0,255,0.22)";
+      g.strokeStyle = hmaj ? "rgba(220,80,80,0.40)" : "rgba(255,150,150,0.35)";
       g.lineWidth   = hmaj ? 1.0 : 0.5;
       g.beginPath(); g.moveTo(0, Math.round(y)+0.5); g.lineTo(w, Math.round(y)+0.5); g.stroke();
     }
@@ -794,7 +794,7 @@ function drawGrid(){
 /* v2y uses adaptive signalRange instead of hardcoded 1023 */
 function v2y(v){
   var range = (signalRange > 0) ? signalRange : 1023;
-  return canvas.height / 2 - (v - signalBaseline) * (canvas.height / range);
+  return canvas.height / 2 + (v - signalBaseline) * (canvas.height / range);
 }
 
 /* ---- render ---- */
@@ -804,6 +804,21 @@ function render(){
 
   var w = canvas.width, h = canvas.height, n = samples.length;
   ctx.drawImage(gridCv, 0, 0);
+
+  /* Calibration pulse (nominal) */
+  if(!eventViewerMode){
+    var calX = 36, calW = 16;
+    var calH = Math.round(canvas.height * 0.08);
+    var calY = Math.round(canvas.height / 2);
+    ctx.strokeStyle = "rgba(0,0,0,0.35)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(calX, calY);
+    ctx.lineTo(calX, calY - calH);
+    ctx.lineTo(calX + calW, calY - calH);
+    ctx.lineTo(calX + calW, calY);
+    ctx.stroke();
+  }
 
   if(n < 2){ requestAnimationFrame(render); return; }
 
@@ -893,7 +908,7 @@ function render(){
   ctx.lineCap  = "round";
 
   var curLO = samples[startIdx][2];
-  ctx.strokeStyle = curLO ? "#0000ff" : "#ff0000";
+  ctx.strokeStyle = curLO ? "#0000ff" : "#000000";
   ctx.beginPath();
   ctx.moveTo(xOff, v2y(samples[startIdx][1]));
 
@@ -909,7 +924,7 @@ function render(){
       ctx.lineTo(px, py);
       ctx.stroke();
       curLO = s[2];
-      ctx.strokeStyle = curLO ? "#0000ff" : "#ff0000";
+      ctx.strokeStyle = curLO ? "#0000ff" : "#000000";
       ctx.beginPath();
       ctx.moveTo(px, py);
     } else {
@@ -935,6 +950,15 @@ function render(){
       ctx.fillText("\u2665 " + lb, lx - 10, ly);
     }
   }
+
+  /* Clinical annotations */
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillText("II", 10, 24);
+  ctx.font = "11px sans-serif";
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.fillText("25 mm/s", 10, h - 22);
+  ctx.fillText("10 mm/mV", 10, h - 8);
 
   /* scroll-position indicator when not live */
   if(!isLive && n > w){
