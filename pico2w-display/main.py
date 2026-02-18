@@ -75,6 +75,18 @@ GREY = display.create_pen(50, 50, 50)
 DEAD_TOP = 14                              # skip defective top 10%
 
 # ---------------------------------------------------------------------------
+# PVC event logging to flash
+# ---------------------------------------------------------------------------
+
+PVC_FILE = "/pvc_events.jsonl"
+PVC_SAMPLES = 2000                         # ~2 s of waveform context
+MAX_PVC_EVENTS = 150                       # cap per session (~1.2 MB)
+pvc_event_flag = False
+pvc_event_ts = 0
+pvc_event_count = 0
+pvc_show_until = 0                         # ticks_ms — flash "PVC" on display
+
+# ---------------------------------------------------------------------------
 # BPM detection  (called from Core 1 display thread)
 # ---------------------------------------------------------------------------
 
@@ -128,7 +140,7 @@ def _recompute_threshold():
 def _detect_beat(value, ts):
     global below_threshold, last_beat_ms, last_beat_rearm_ms, _bpm
     global thresh_idx, thresh_fill, thresh_counter, current_bpm
-    global pvc_armed
+    global pvc_armed, pvc_event_flag, pvc_event_ts
 
     thresh_buf[thresh_idx] = value
     thresh_idx = (thresh_idx + 1) % THRESH_BUF_SIZE
@@ -154,6 +166,8 @@ def _detect_beat(value, ts):
     # PVC detection (opposite-direction spike — not counted as beat)
     if pvc_hit:
         pvc_armed = False
+        pvc_event_flag = True
+        pvc_event_ts = ts
     elif pvc_reset_cond:
         pvc_armed = True
 
@@ -173,6 +187,30 @@ def _detect_beat(value, ts):
     elif reset_cond:
         if time.ticks_diff(ts, last_beat_rearm_ms) > REFRACTORY_MS:
             below_threshold = peaks_go_up
+
+
+def _save_pvc_event(ts, widx):
+    """Append one PVC event (metadata + waveform snippet) to flash."""
+    global pvc_event_count
+    if pvc_event_count >= MAX_PVC_EVENTS:
+        return
+    try:
+        with open(PVC_FILE, "a") as f:
+            f.write('{"v":1,"t_ms":%d,"bpm":%d,"samples":[' % (ts, current_bpm))
+            start = (widx - PVC_SAMPLES) % WAVE_LEN
+            CHUNK = 200
+            for c in range(0, PVC_SAMPLES, CHUNK):
+                end = min(c + CHUNK, PVC_SAMPLES)
+                if c > 0:
+                    f.write(',')
+                f.write(','.join(
+                    str(wave_buf[(start + i) % WAVE_LEN])
+                    for i in range(c, end)
+                ))
+            f.write(']}\n')
+        pvc_event_count += 1
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +301,7 @@ def _draw_waveform(x0, y0, w, h, widx):
 
 def display_thread():
     """Runs on Core 1.  Renders display at ~5 Hz + BPM detection."""
+    global pvc_show_until
     display_page = 0
     backlight_on = True
     btn_a_last = 0
@@ -328,7 +367,19 @@ def display_thread():
 
         DT = DEAD_TOP
 
+        # PVC flash indicator (shared across pages)
+        show_pvc = time.ticks_diff(pvc_show_until, ts) > 0
+
         if display_page == 0:
+            # Row 0 (y=2): PVC flash + event count
+            if show_pvc:
+                display.set_pen(YELLOW)
+                display.text("PVC", 2, 2, scale=2)
+            if pvc_event_count > 0:
+                display.set_pen(YELLOW if show_pvc else GREY)
+                display.text(str(pvc_event_count), 55, 6, scale=1)
+
+            # Row 1 (y=DT+2): ECG label + BPM
             wave_top = DT + 22
             wave_h = HEIGHT - wave_top - 2
 
@@ -367,8 +418,18 @@ def display_thread():
             else:
                 display.set_pen(GREEN)
             display.text(bpm_s, 2, HEIGHT - bar_h + 1, scale=1)
+            if show_pvc:
+                display.set_pen(YELLOW)
+                display.text("PVC", 180, HEIGHT - bar_h + 1, scale=1)
 
         display.update()
+
+        # Save PVC event to flash if pending
+        if pvc_event_flag:
+            pvc_event_flag = False
+            pvc_show_until = ts + 2000     # flash for 2 s
+            _save_pvc_event(pvc_event_ts, widx)
+
         time.sleep_ms(200)         # 5 Hz is plenty for the display
 
 
@@ -379,6 +440,13 @@ def display_thread():
 
 def main():
     global current_value, leads_off_flag, wave_idx
+
+    # Write session marker to PVC event log
+    try:
+        with open(PVC_FILE, "a") as f:
+            f.write('{"v":1,"type":"session","t_ms":0}\n')
+    except OSError:
+        pass
 
     # Start display on Core 1
     _thread.start_new_thread(display_thread, ())
