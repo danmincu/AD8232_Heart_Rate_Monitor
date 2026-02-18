@@ -64,6 +64,9 @@ class ECGState:
         self.recent_values = deque(maxlen=5000)  # ~5 s of ADC values
         self.adaptive_threshold = BPM_THRESHOLD  # initial guess
         self.rearm_threshold = BPM_THRESHOLD     # hysteresis re-arm level
+        self.pvc_threshold = BPM_THRESHOLD       # opposite-direction PVC detect
+        self.pvc_rearm = BPM_THRESHOLD           # PVC re-arm level
+        self.pvc_armed = True                    # PVC detector armed
         self.peaks_go_up = True                  # auto-detected polarity
         self.thresh_counter = 0                  # recompute every 500 samples
         # CSV
@@ -106,10 +109,14 @@ def _update_adaptive_threshold():
         state.peaks_go_up = True
         state.adaptive_threshold = p50 + 0.80 * range_up
         state.rearm_threshold = p50 + 0.30 * range_up
+        state.pvc_threshold = p50 - 0.15 * range_up
+        state.pvc_rearm = p50 - 0.05 * range_up
     else:
         state.peaks_go_up = False
         state.adaptive_threshold = p50 - 0.80 * range_down
         state.rearm_threshold = p50 - 0.30 * range_down
+        state.pvc_threshold = p50 + 0.15 * range_down
+        state.pvc_rearm = p50 + 0.05 * range_down
     log.debug(
         "Adaptive threshold: %.1f  rearm: %.1f  polarity=%s  p1=%d p50=%d p99=%d",
         state.adaptive_threshold, state.rearm_threshold,
@@ -288,9 +295,20 @@ def process_sample(raw_line: str):
         if state.peaks_go_up:
             beat_detected = value > thresh and state.below_threshold
             reset_condition = value < state.rearm_threshold
+            pvc_hit = value < state.pvc_threshold and state.pvc_armed
+            pvc_reset = value > state.pvc_rearm
         else:
             beat_detected = value < thresh and not state.below_threshold
             reset_condition = value > state.rearm_threshold
+            pvc_hit = value > state.pvc_threshold and state.pvc_armed
+            pvc_reset = value < state.pvc_rearm
+
+        # PVC detection (opposite-direction spike — not counted as beat)
+        if pvc_hit:
+            state.pvc_armed = False
+            bpm = -1  # PVC marker
+        elif pvc_reset:
+            state.pvc_armed = True
 
         if beat_detected:
             if state.peaks_go_up:
@@ -718,6 +736,7 @@ var needsRedraw = true;
 var signalBaseline = -1;
 var signalRange = -1;          // adaptive vertical range (auto-scaled)
 var lastBPMs = [];
+var COMPRESS = 5;              // samples per pixel (2 = show 2x more data)
 
 /* ---- arrhythmia state ---- */
 var arrhythmiaMarkers = [];   // [{sampleIdx, type, filename}]
@@ -789,9 +808,9 @@ function render(){
   if(n < 2){ requestAnimationFrame(render); return; }
 
   var endIdx   = Math.max(1, n - viewOffset);
-  var startIdx = Math.max(0, endIdx - w);
+  var startIdx = Math.max(0, endIdx - w * COMPRESS);
   var count    = endIdx - startIdx;
-  var xOff     = w - count;           /* right-align trace */
+  var xOff     = w - Math.ceil(count / COMPRESS);  /* right-align trace */
 
   /* auto-centre + auto-scale from visible data */
   var vmin = 99999, vmax = -99999;
@@ -824,7 +843,7 @@ function render(){
   if(!eventViewerMode){
     for(var mi = 0; mi < arrhythmiaMarkers.length; mi++){
       var marker = arrhythmiaMarkers[mi];
-      var mx = marker.sampleIdx - startIdx + xOff;
+      var mx = Math.round((marker.sampleIdx - startIdx) / COMPRESS) + xOff;
       if(mx >= 0 && mx < w){
         var mcolor = marker.type === "pause" ? "rgba(255,143,0,0.25)"
                    : marker.type === "premature" ? "rgba(255,87,34,0.25)"
@@ -857,8 +876,8 @@ function render(){
       var hlStart = Math.max(0, beatPositions.length - anomCount - 5);
       var hlEnd = Math.min(beatPositions.length, hlStart + anomCount + 2);
       if(hlStart < beatPositions.length && hlEnd > 0){
-        var hlX1 = beatPositions[hlStart] - startIdx + xOff;
-        var hlX2 = beatPositions[Math.min(hlEnd, beatPositions.length - 1)] - startIdx + xOff;
+        var hlX1 = Math.round((beatPositions[hlStart] - startIdx) / COMPRESS) + xOff;
+        var hlX2 = Math.round((beatPositions[Math.min(hlEnd, beatPositions.length - 1)] - startIdx) / COMPRESS) + xOff;
         var hlColor = eventViewerData.type === "pause" ? "rgba(255,143,0,0.15)"
                     : eventViewerData.type === "premature" ? "rgba(255,87,34,0.15)"
                     : "rgba(76,175,80,0.15)";
@@ -883,7 +902,7 @@ function render(){
 
   for(i = startIdx + 1; i < endIdx; i++){
     s  = samples[i];
-    px = (i - startIdx) + xOff;
+    px = Math.round((i - startIdx) / COMPRESS) + xOff;
     py = v2y(s[1]);
 
     if(s[2] !== curLO){
@@ -907,16 +926,21 @@ function render(){
   ctx.font = "bold 14px sans-serif";
   for(i = 0; i < bpmLabels.length; i++){
     var lx = bpmLabels[i][0], lb = bpmLabels[i][1];
-    var ly = Math.round(h * 0.18);
-    ctx.fillStyle = "rgba(0,0,0,0.30)";
-    ctx.fillText("\u2665 " + lb, lx - 10, ly);
+    var ly = Math.round(h * 0.08);
+    if(lb < 0){
+      ctx.fillStyle = "rgba(255,100,0,0.60)";
+      ctx.fillText("PVC", lx - 10, ly);
+    } else {
+      ctx.fillStyle = "rgba(0,0,0,0.30)";
+      ctx.fillText("\u2665 " + lb, lx - 10, ly);
+    }
   }
 
   /* scroll-position indicator when not live */
   if(!isLive && n > w){
     var totalW = n;
-    var visFrac = Math.min(1, w / totalW);
-    var scrollFrac = viewOffset / Math.max(1, n - w);
+    var visFrac = Math.min(1, w * COMPRESS / totalW);
+    var scrollFrac = viewOffset / Math.max(1, n - w * COMPRESS);
     var barW = Math.max(30, w * visFrac);
     var barX = (w - barW) * (1 - scrollFrac);
     ctx.fillStyle = "rgba(0,0,0,0.25)";
@@ -942,7 +966,7 @@ canvas.addEventListener("wheel", function(e){
   var delta = (e.deltaMode === 1) ? e.deltaY * 40 : e.deltaY;
   viewOffset = Math.round(Math.max(0, Math.min(
     viewOffset - delta,
-    Math.max(0, samples.length - canvas.width)
+    Math.max(0, samples.length - canvas.width * COMPRESS)
   )));
   isLive = (viewOffset === 0) && !eventViewerMode;
   document.getElementById("lbtn").style.display = (isLive && !eventViewerMode) ? "none" : "inline-block";
@@ -1118,7 +1142,7 @@ function connect(){
       lastBPMs = [];
       var initSamples = msg.samples || [];
       for(var k = 0; k < initSamples.length; k++){
-        if(initSamples[k][3] !== null && initSamples[k][3] !== undefined){
+        if(initSamples[k][3] !== null && initSamples[k][3] !== undefined && initSamples[k][3] > 0){
           lastBPMs.push(initSamples[k][3]);
         }
       }
@@ -1139,7 +1163,7 @@ function connect(){
       var added = batch.length;
       for(var i = 0; i < added; i++){
         samples.push(batch[i]);
-        if(batch[i][3] !== null && batch[i][3] !== undefined){
+        if(batch[i][3] !== null && batch[i][3] !== undefined && batch[i][3] > 0){
           lastBPMs.push(batch[i][3]);
           if(lastBPMs.length > 10) lastBPMs.shift();
           updateBPMBar();
@@ -1162,7 +1186,7 @@ function connect(){
         }
       }
       /* clamp */
-      viewOffset = Math.min(viewOffset, Math.max(0, samples.length - canvas.width));
+      viewOffset = Math.min(viewOffset, Math.max(0, samples.length - canvas.width * COMPRESS));
       if(isLive) needsRedraw = true;
       return;
     }

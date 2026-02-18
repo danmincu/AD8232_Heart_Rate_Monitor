@@ -1,8 +1,8 @@
 """AD8232 ECG Serial Sender + Pico Display — Raspberry Pi Pico 2W.
 
 Dual-core architecture:
-    Core 0: ADC read + serial send at ~1kHz (never blocked by display)
-    Core 1: Display rendering at ~5Hz (reads shared buffer, never touches ADC)
+    Core 0: ADC read + serial send at ~1kHz (lean — no computation)
+    Core 1: BPM detection + display rendering at ~5Hz (reads shared buffer)
 
 Serial protocol (unchanged — compatible with ecg_server.py):
     - Integer 0-1023 + newline   — normal ADC reading
@@ -42,11 +42,11 @@ lo_minus = Pin(3, Pin.IN, Pin.PULL_DOWN)   # AD8232 LO-
 
 # ---------------------------------------------------------------------------
 # Shared state — written by Core 0, read by Core 1
-# All are simple scalars or pre-allocated arrays (no GC contention).
+# All are simple scalars or pre-allocated arrays (no cross-core contention).
 # ---------------------------------------------------------------------------
 
-WAVE_COMPRESS = 4
-WAVE_LEN = 240 * WAVE_COMPRESS            # 960 samples in ring buffer
+WAVE_COMPRESS = 8
+WAVE_LEN = 240 * WAVE_COMPRESS            # 1920 samples in ring buffer
 wave_buf = array("H", (512 for _ in range(WAVE_LEN)))
 wave_idx = 0
 
@@ -75,7 +75,7 @@ GREY = display.create_pen(50, 50, 50)
 DEAD_TOP = 14                              # skip defective top 10%
 
 # ---------------------------------------------------------------------------
-# BPM detection  (runs on Core 0, lightweight)
+# BPM detection  (called from Core 1 display thread)
 # ---------------------------------------------------------------------------
 
 THRESH_BUF_SIZE = 2000
@@ -86,9 +86,12 @@ thresh_recompute_every = 500
 thresh_counter = 0
 adaptive_threshold = 620
 rearm_threshold = 620
+pvc_threshold = 620
+pvc_rearm = 620
 peaks_go_up = True
 
 below_threshold = True
+pvc_armed = True
 last_beat_ms = 0
 last_beat_rearm_ms = 0
 REFRACTORY_MS = 350
@@ -98,6 +101,7 @@ _bpm = 0
 
 def _recompute_threshold():
     global adaptive_threshold, rearm_threshold, peaks_go_up
+    global pvc_threshold, pvc_rearm
     n = min(thresh_fill, THRESH_BUF_SIZE)
     if n < 100:
         return
@@ -111,15 +115,20 @@ def _recompute_threshold():
         peaks_go_up = True
         adaptive_threshold = p50 + int(0.80 * range_up)
         rearm_threshold = p50 + int(0.30 * range_up)
+        pvc_threshold = p50 - int(0.15 * range_up)
+        pvc_rearm = p50 - int(0.05 * range_up)
     else:
         peaks_go_up = False
         adaptive_threshold = p50 - int(0.80 * range_down)
         rearm_threshold = p50 - int(0.30 * range_down)
+        pvc_threshold = p50 + int(0.15 * range_down)
+        pvc_rearm = p50 + int(0.05 * range_down)
 
 
 def _detect_beat(value, ts):
     global below_threshold, last_beat_ms, last_beat_rearm_ms, _bpm
     global thresh_idx, thresh_fill, thresh_counter, current_bpm
+    global pvc_armed
 
     thresh_buf[thresh_idx] = value
     thresh_idx = (thresh_idx + 1) % THRESH_BUF_SIZE
@@ -134,10 +143,21 @@ def _detect_beat(value, ts):
     if peaks_go_up:
         beat_hit = value > thr and below_threshold
         reset_cond = value < rearm_threshold
+        pvc_hit = value < pvc_threshold and pvc_armed
+        pvc_reset_cond = value > pvc_rearm
     else:
         beat_hit = value < thr and not below_threshold
         reset_cond = value > rearm_threshold
+        pvc_hit = value > pvc_threshold and pvc_armed
+        pvc_reset_cond = value < pvc_rearm
 
+    # PVC detection (opposite-direction spike — not counted as beat)
+    if pvc_hit:
+        pvc_armed = False
+    elif pvc_reset_cond:
+        pvc_armed = True
+
+    # Normal beat detection
     if beat_hit:
         below_threshold = not peaks_go_up
         last_beat_rearm_ms = ts
@@ -156,7 +176,7 @@ def _detect_beat(value, ts):
 
 
 # ---------------------------------------------------------------------------
-# Core 1 — Display thread  (never touches ADC, never blocks serial)
+# Core 1 — Display + BPM thread  (never touches ADC, never blocks serial)
 # ---------------------------------------------------------------------------
 
 
@@ -221,11 +241,12 @@ def _draw_waveform(x0, y0, w, h, widx):
 
 
 def display_thread():
-    """Runs on Core 1.  Renders display at ~5 Hz."""
+    """Runs on Core 1.  Renders display at ~5 Hz + BPM detection."""
     display_page = 0
     backlight_on = True
     btn_a_last = 0
     btn_b_last = 0
+    bpm_read_idx = 0       # Core 1's read position in wave_buf
 
     # Splash
     display.set_pen(BLACK)
@@ -251,6 +272,30 @@ def display_thread():
         # Snapshot the write index (Core 0 may advance it, that's fine)
         widx = wave_idx
 
+        # ---- Process new samples for BPM (moved from Core 0) ----
+        if not leads_off_flag:
+            if widx >= bpm_read_idx:
+                new_count = widx - bpm_read_idx
+            else:
+                new_count = WAVE_LEN - bpm_read_idx + widx
+
+            if new_count > WAVE_LEN:
+                new_count = WAVE_LEN  # overflow guard
+
+            if new_count > 1000:
+                # Stale data (leads were off or major gap) — skip
+                bpm_read_idx = widx
+            else:
+                for i in range(new_count):
+                    idx = (bpm_read_idx + i) % WAVE_LEN
+                    val = wave_buf[idx]
+                    sample_ts = ts - (new_count - 1 - i)  # ~1ms per sample
+                    _detect_beat(val, sample_ts)
+                bpm_read_idx = widx
+        else:
+            # Leads off — skip over these samples, don't pollute threshold
+            bpm_read_idx = widx
+
         display.set_pen(BLACK)
         display.clear()
 
@@ -264,13 +309,13 @@ def display_thread():
             display.text("ECG", 2, DT + 2, scale=2)
             bpm = current_bpm
             if bpm > 0:
-                display.set_pen(RED)
-                display.text(str(bpm), 140, DT, scale=3)
                 display.set_pen(WHITE)
-                display.text("BPM", 200, DT + 6, scale=1)
+                display.text(str(bpm), 120, DT - 2, scale=4)
+                display.set_pen(GREY)
+                display.text("BPM", 210, DT + 8, scale=1)
             else:
                 display.set_pen(GREY)
-                display.text("-- BPM", 140, DT + 2, scale=2)
+                display.text("-- BPM", 120, DT + 2, scale=2)
 
             display.set_pen(GREY)
             display.line(0, wave_top - 2, WIDTH - 1, wave_top - 2)
@@ -301,7 +346,7 @@ def display_thread():
 
 
 # ---------------------------------------------------------------------------
-# Core 0 — ADC + serial  (identical to the bare version that works)
+# Core 0 — ADC + serial  (lean — identical to main_bare.py + ring buffer)
 # ---------------------------------------------------------------------------
 
 
@@ -312,9 +357,6 @@ def main():
     _thread.start_new_thread(display_thread, ())
 
     while True:
-        ts = time.ticks_ms()
-
-        # ---- Read & send (exactly like main_bare.py) ----
         if lo_plus.value() == 1 or lo_minus.value() == 1:
             leads_off_flag = True
             current_value = 512
@@ -323,9 +365,7 @@ def main():
             leads_off_flag = False
             current_value = adc.read_u16() >> 6
             sys.stdout.write(str(current_value) + "\n")
-            _detect_beat(current_value, ts)
 
-        # Store in shared ring buffer (atomic 16-bit write)
         wave_buf[wave_idx] = current_value
         wave_idx = (wave_idx + 1) % WAVE_LEN
 
