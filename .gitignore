@@ -196,3 +196,5 @@ pip-log.txt
 #############
 
 /Misc
+
+.venv
