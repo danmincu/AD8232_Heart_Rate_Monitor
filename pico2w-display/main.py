@@ -45,8 +45,8 @@ lo_minus = Pin(3, Pin.IN, Pin.PULL_DOWN)   # AD8232 LO-
 # All are simple scalars or pre-allocated arrays (no cross-core contention).
 # ---------------------------------------------------------------------------
 
-WAVE_COMPRESS = 8
-WAVE_LEN = 240 * WAVE_COMPRESS            # 1920 samples in ring buffer
+WAVE_COMPRESS = 16
+WAVE_LEN = 240 * WAVE_COMPRESS            # 3840 samples in ring buffer (~4 s)
 wave_buf = array("H", (512 for _ in range(WAVE_LEN)))
 wave_idx = 0
 
@@ -181,7 +181,13 @@ def _detect_beat(value, ts):
 
 
 def _draw_waveform(x0, y0, w, h, widx):
-    """Draw 4x-compressed ECG waveform from shared ring buffer."""
+    """Draw min-max compressed ECG waveform from shared ring buffer.
+
+    For each pixel column, tracks both the min and max sample values in
+    the group and draws a vertical line spanning both.  This guarantees
+    deep QRS spikes (low peaks) are always visible regardless of
+    compression level.
+    """
     display.set_pen(GREY)
     mid = y0 + (h >> 1)
     display.line(x0, mid, x0 + w - 1, mid)
@@ -201,43 +207,58 @@ def _draw_waveform(x0, y0, w, h, widx):
         vrange = 30
     vrange = vrange + (vrange * 2 // 5)   # 40% padding
 
+    half_h = h >> 1
+
+    def _v2y(v):
+        py = y0 + h - ((v - baseline) * h // vrange + half_h)
+        if py < y0:
+            return y0
+        if py > y0 + h:
+            return y0 + h
+        return py
+
     display.set_pen(RED)
 
-    # First pixel group
-    best = wave_buf[widx % WAVE_LEN]
-    best_dev = abs(best - baseline)
+    # First pixel group — find min/max
+    v0 = wave_buf[widx % WAVE_LEN]
+    gmin = v0
+    gmax = v0
     for s in range(1, WAVE_COMPRESS):
         v = wave_buf[(widx + s) % WAVE_LEN]
-        d = abs(v - baseline)
-        if d > best_dev:
-            best = v
-            best_dev = d
-    prev_y = y0 + h - ((best - baseline) * h // vrange + (h >> 1))
-    if prev_y < y0:
-        prev_y = y0
-    elif prev_y > y0 + h:
-        prev_y = y0 + h
+        if v < gmin:
+            gmin = v
+        if v > gmax:
+            gmax = v
+    prev_ylo = _v2y(gmin)
+    prev_yhi = _v2y(gmax)
     prev_x = x0
+    # Draw vertical span for first column
+    if prev_ylo != prev_yhi:
+        display.line(prev_x, prev_yhi, prev_x, prev_ylo)
 
     for i in range(1, w):
         base_s = i * WAVE_COMPRESS
-        best = wave_buf[(widx + base_s) % WAVE_LEN]
-        best_dev = abs(best - baseline)
+        v0 = wave_buf[(widx + base_s) % WAVE_LEN]
+        gmin = v0
+        gmax = v0
         for s in range(1, WAVE_COMPRESS):
             v = wave_buf[(widx + base_s + s) % WAVE_LEN]
-            d = abs(v - baseline)
-            if d > best_dev:
-                best = v
-                best_dev = d
-        py = y0 + h - ((best - baseline) * h // vrange + (h >> 1))
-        if py < y0:
-            py = y0
-        elif py > y0 + h:
-            py = y0 + h
+            if v < gmin:
+                gmin = v
+            if v > gmax:
+                gmax = v
+        ylo = _v2y(gmin)
+        yhi = _v2y(gmax)
         px = x0 + i
-        display.line(prev_x, prev_y, px, py)
+        # Connect to previous column
+        display.line(prev_x, prev_ylo, px, ylo)
+        display.line(prev_x, prev_yhi, px, yhi)
+        # Draw vertical span for this column (fills in the spike)
+        if ylo != yhi:
+            display.line(px, yhi, px, ylo)
         prev_x = px
-        prev_y = py
+        prev_ylo = ylo
+        prev_yhi = yhi
 
 
 def display_thread():
@@ -268,6 +289,12 @@ def display_thread():
             btn_b_last = ts
             backlight_on = not backlight_on
             display.set_backlight(0.8 if backlight_on else 0.0)
+
+        # Screen off — skip all work, let Core 0 have maximum CPU
+        if not backlight_on:
+            bpm_read_idx = wave_idx   # stay caught up so we don't process stale data on wake
+            time.sleep_ms(200)
+            continue
 
         # Snapshot the write index (Core 0 may advance it, that's fine)
         widx = wave_idx
