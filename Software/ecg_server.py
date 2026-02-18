@@ -32,6 +32,7 @@ BUFFER_SIZE = 25000          # ~25 s at 1 kHz
 BPM_THRESHOLD = 620.0        # ADC threshold for beat detection
 BPM_WINDOW = 500             # rolling-average window (beats)
 CSV_FLUSH_EVERY = 1000       # flush CSV every N samples
+BPM_REFRACTORY_MS = 350      # ignore threshold resets for 350ms after a beat
 
 # Arrhythmia detection
 ARR_DEVIATION_PCT = 0.30        # 30% R-R deviation from baseline = anomaly
@@ -56,11 +57,13 @@ class ECGState:
         self.beats = [0.0] * BPM_WINDOW
         self.beat_index = 0
         self.last_beat_ms = 0
+        self.last_beat_rearm_ms = 0          # refractory period tracking
         self.below_threshold = True
         self.current_bpm = 0
         # Adaptive threshold
         self.recent_values = deque(maxlen=5000)  # ~5 s of ADC values
         self.adaptive_threshold = BPM_THRESHOLD  # initial guess
+        self.rearm_threshold = BPM_THRESHOLD     # hysteresis re-arm level
         self.peaks_go_up = True                  # auto-detected polarity
         self.thresh_counter = 0                  # recompute every 500 samples
         # CSV
@@ -87,28 +90,31 @@ def _update_adaptive_threshold():
     """Recompute adaptive threshold from recent ADC values.
 
     Determines signal polarity (normal vs inverted) and sets the beat-detection
-    threshold at 55 % of the peak range from the median baseline.
+    threshold at 80 % of the peak range from the median baseline, with a
+    30 % re-arm threshold (Schmitt trigger hysteresis).
     """
     vals = sorted(state.recent_values)
     n = len(vals)
     if n < 100:
         return  # not enough data yet
-    p5 = vals[int(n * 0.05)]
+    p1 = vals[int(n * 0.01)]
     p50 = vals[int(n * 0.50)]
-    p95 = vals[int(n * 0.95)]
-    range_up = p95 - p50
-    range_down = p50 - p5
+    p99 = vals[int(n * 0.99)]
+    range_up = p99 - p50
+    range_down = p50 - p1
     if range_up >= range_down:
         state.peaks_go_up = True
-        state.adaptive_threshold = p50 + 0.55 * range_up
+        state.adaptive_threshold = p50 + 0.80 * range_up
+        state.rearm_threshold = p50 + 0.30 * range_up
     else:
         state.peaks_go_up = False
-        state.adaptive_threshold = p50 - 0.55 * range_down
+        state.adaptive_threshold = p50 - 0.80 * range_down
+        state.rearm_threshold = p50 - 0.30 * range_down
     log.debug(
-        "Adaptive threshold: %.1f  polarity=%s  p5=%d p50=%d p95=%d",
-        state.adaptive_threshold,
+        "Adaptive threshold: %.1f  rearm: %.1f  polarity=%s  p1=%d p50=%d p99=%d",
+        state.adaptive_threshold, state.rearm_threshold,
         "UP" if state.peaks_go_up else "DOWN",
-        p5, p50, p95,
+        p1, p50, p99,
     )
 
 
@@ -277,20 +283,21 @@ def process_sample(raw_line: str):
             _update_adaptive_threshold()
             state.thresh_counter = 0
 
-        # Adaptive threshold-crossing beat detection
+        # Adaptive threshold-crossing beat detection (Schmitt trigger)
         thresh = state.adaptive_threshold
         if state.peaks_go_up:
             beat_detected = value > thresh and state.below_threshold
-            reset_condition = value < thresh
+            reset_condition = value < state.rearm_threshold
         else:
             beat_detected = value < thresh and not state.below_threshold
-            reset_condition = value > thresh
+            reset_condition = value > state.rearm_threshold
 
         if beat_detected:
             if state.peaks_go_up:
                 state.below_threshold = False
             else:
                 state.below_threshold = True
+            state.last_beat_rearm_ms = ts     # start refractory period
             if state.last_beat_ms > 0:
                 diff = ts - state.last_beat_ms
                 if 200 < diff < 3000:                    # 20-300 BPM
@@ -306,10 +313,12 @@ def process_sample(raw_line: str):
                     _check_arrhythmia(ts, diff)
             state.last_beat_ms = ts
         elif reset_condition:
-            if state.peaks_go_up:
-                state.below_threshold = True
-            else:
-                state.below_threshold = False
+            # Only re-arm after refractory period to prevent T-wave false triggers
+            if ts - state.last_beat_rearm_ms > BPM_REFRACTORY_MS:
+                if state.peaks_go_up:
+                    state.below_threshold = True
+                else:
+                    state.below_threshold = False
 
     sample = (ts, value, leads_off, bpm)
     state.samples.append(sample)
@@ -707,6 +716,7 @@ var viewOffset = 0;     // 0 = live
 var isLive = true;
 var needsRedraw = true;
 var signalBaseline = -1;
+var signalRange = -1;          // adaptive vertical range (auto-scaled)
 var lastBPMs = [];
 
 /* ---- arrhythmia state ---- */
@@ -762,7 +772,11 @@ function drawGrid(){
 }
 
 /* ---- helpers ---- */
-function v2y(v){ return canvas.height / 2 - (v - signalBaseline) * (canvas.height / 1023); }
+/* v2y uses adaptive signalRange instead of hardcoded 1023 */
+function v2y(v){
+  var range = (signalRange > 0) ? signalRange : 1023;
+  return canvas.height / 2 - (v - signalBaseline) * (canvas.height / range);
+}
 
 /* ---- render ---- */
 function render(){
@@ -779,13 +793,32 @@ function render(){
   var count    = endIdx - startIdx;
   var xOff     = w - count;           /* right-align trace */
 
-  /* auto-centre: smooth baseline from visible data */
-  var sum = 0;
-  for(var j = startIdx; j < endIdx; j++) sum += samples[j][1];
-  var visAvg = sum / (endIdx - startIdx);
-  if(signalBaseline < 0) signalBaseline = visAvg;
-  else if(!eventViewerMode) signalBaseline = signalBaseline * 0.93 + visAvg * 0.07;
-  else signalBaseline = visAvg;
+  /* auto-centre + auto-scale from visible data */
+  var vmin = 99999, vmax = -99999;
+  for(var j = startIdx; j < endIdx; j++){
+    var sv = samples[j][1];
+    if(sv < vmin) vmin = sv;
+    if(sv > vmax) vmax = sv;
+  }
+
+  /* Centre on midpoint of min/max (not the mean — the mean is biased toward
+     baseline and causes asymmetric peaks to clip off-screen) */
+  var visMid = (vmin + vmax) / 2;
+  if(signalBaseline < 0) signalBaseline = visMid;
+  else if(!eventViewerMode) signalBaseline = signalBaseline * 0.90 + visMid * 0.10;
+  else signalBaseline = visMid;
+
+  /* Adaptive range: grow FAST to catch peaks, shrink slowly to stay stable.
+     30 % padding ensures peaks don't touch the very edge of the canvas. */
+  var visRange = Math.max(vmax - vmin, 30) * 1.3;
+  if(signalRange < 0){
+    signalRange = visRange;
+  } else if(!eventViewerMode){
+    if(visRange > signalRange) signalRange = signalRange * 0.3 + visRange * 0.7;
+    else                       signalRange = signalRange * 0.98 + visRange * 0.02;
+  } else {
+    signalRange = visRange;
+  }
 
   /* Arrhythmia markers — vertical bands on live trace */
   if(!eventViewerMode){
@@ -987,6 +1020,7 @@ window._viewEvent = function(filename){
     viewOffset = 0;
     isLive = false;
     signalBaseline = -1;
+    signalRange = -1;
     needsRedraw = true;
 
     /* Show exit button */
@@ -1024,6 +1058,7 @@ function _exitViewer(){
   viewOffset = 0;
   isLive = true;
   signalBaseline = -1;
+  signalRange = -1;
   var lbtn = document.getElementById("lbtn");
   lbtn.textContent = "\u25b6 LIVE";
   lbtn.style.display = "none";
@@ -1078,6 +1113,7 @@ function connect(){
       if(!eventViewerMode){
         samples = msg.samples || [];
         signalBaseline = -1;
+        signalRange = -1;
       }
       lastBPMs = [];
       var initSamples = msg.samples || [];
