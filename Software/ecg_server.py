@@ -805,21 +805,6 @@ function render(){
   var w = canvas.width, h = canvas.height, n = samples.length;
   ctx.drawImage(gridCv, 0, 0);
 
-  /* Calibration pulse (nominal) */
-  if(!eventViewerMode){
-    var calX = 36, calW = 16;
-    var calH = Math.round(canvas.height * 0.08);
-    var calY = Math.round(canvas.height / 2);
-    ctx.strokeStyle = "rgba(0,0,0,0.35)";
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.moveTo(calX, calY);
-    ctx.lineTo(calX, calY - calH);
-    ctx.lineTo(calX + calW, calY - calH);
-    ctx.lineTo(calX + calW, calY);
-    ctx.stroke();
-  }
-
   if(n < 2){ requestAnimationFrame(render); return; }
 
   var endIdx   = Math.max(1, n - viewOffset);
