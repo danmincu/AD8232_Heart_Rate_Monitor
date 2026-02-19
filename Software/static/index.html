@@ -261,7 +261,7 @@ function render(){
                         : marker.type === "premature" ? "#ff5722" : "#4caf50";
           var label = marker.type === "pause" ? "PAUSE"
                     : marker.type === "premature" ? "PVC" : "REC";
-          ctx.fillText(label, mx - 12, rowTop + 14);
+          ctx.fillText(label, mx - 12, rowTop + rowH - 18);
         }
       }
     }
@@ -350,7 +350,7 @@ function render(){
       var ly = rowTop + 16;
       if(lb < 0){
         ctx.fillStyle = "rgba(255,100,0,0.60)";
-        ctx.fillText("PVC", lx - 10, ly);
+        ctx.fillText("PVC", lx - 10, rowTop + rowH - 6);
       } else {
         ctx.fillStyle = "rgba(0,0,0,0.30)";
         ctx.fillText("\u2665 " + lb, lx - 10, ly);

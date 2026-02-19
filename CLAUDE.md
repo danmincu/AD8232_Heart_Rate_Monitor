@@ -27,7 +27,7 @@ Reads analog pin A0, sends raw ADC values (0–1023) or `!` (leads-off) over ser
 Desktop app (Processing/Java, not Arduino): real-time ECG waveform (red=valid, blue=leads-off), BPM via fixed 620.0 ADC threshold with rolling 500-beat average, calibration grid, PNG frame export. Serial port selected via `Serial.list()[2]`.
 
 ### 3. Python web server (`Software/ecg_server.py`)
-Single-file aiohttp server (~1280 lines). The entire browser frontend (HTML/CSS/JS SPA) is embedded as the `HTML_PAGE` string literal (~600 lines of JS using raw canvas 2D rendering — no framework). To modify the web UI, edit the `HTML_PAGE` variable inside `ecg_server.py`.
+aiohttp async server (~700 lines). The browser frontend is a separate HTML/CSS/JS SPA in `Software/static/index.html` (~800 lines of raw canvas 2D rendering — no framework), loaded at startup. To modify the web UI, edit `Software/static/index.html`.
 
 Server-side features:
 - Adaptive threshold BPM detection (Schmitt trigger with auto-polarity via percentile analysis)
@@ -89,6 +89,10 @@ Unidirectional MCU→host. ASCII newline-terminated: integer `0`–`1023` (ADC r
 **Event JSON** (`Software/ecg_data/events/event_YYYYMMDD_HHMMSS_{type}.json`): Contains `version`, `type` (pause/premature/manual), `baseline_rr_ms`, `anomalous_beats` array, and raw `samples` array with format `[timestamp_ms, raw_value, leads_off, bpm_or_null]`.
 
 **Pico PVC log** (`/pvc_events.jsonl` on flash): JSONL with `v`, `t_ms`, `bpm`, and `samples` array (raw ADC values only, ~2000 samples per event).
+
+## ECG Rendering Standards
+
+`ECG.md` documents clinical ECG display guidelines (signal orientation, grid formatting, trace colors, calibration, strip layout). Consult this when modifying any waveform rendering in the web UI, Processing app, or Pico display.
 
 ## Licensing
 
