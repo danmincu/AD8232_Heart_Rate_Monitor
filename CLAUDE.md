@@ -40,16 +40,25 @@ Server-side features:
 
 Global mutable state lives in the `ECGState` singleton (`state`). The beat detection algorithm (`process_sample`) and threshold adaptation (`_update_adaptive_threshold`) are shared logic that the Pico 2W reimplements in MicroPython with the same percentile/Schmitt-trigger approach.
 
-### 4. Pico 2W MicroPython display (`pico2w-display/`)
+WebSocket message types (server→client): `init` (config + recent samples + BPM on connect), `d` (data batch at 60Hz), `history_resp` (response to scroll-back request), `arrhythmia_event` (real-time alert with event_type + filename). Client→server: `history` (request older samples by start index + count).
+
+### 4. Pico 2W MicroPython display + WiFi web server (`pico2w-display/`)
 Runs on Raspberry Pi Pico 2W with Pimoroni Pico Display. Dual-core via `_thread`:
-- **Core 0** (`main()`): ADC read + serial output at ~1kHz (same protocol as Arduino). Writes to `wave_buf` ring buffer. Must stay lean — no allocations, no display calls.
-- **Core 1** (`display_thread()`): Reads `wave_buf`, runs BPM detection + display rendering at ~5Hz. Owns all display/PicoGraphics objects.
+- **Core 0** (`main()`): WiFi AP init (one-time, blocking) + ADC read + serial output at ~1kHz (same protocol as Arduino). Writes to `wave_buf` ring buffer. Must stay lean — no allocations, no display calls.
+- **Core 1** (`display_thread()` → `asyncio.run()`): Runs asyncio event loop with three concurrent tasks:
+  - `_display_task()`: Reads `wave_buf`, runs BPM detection + display rendering at ~5Hz. Owns all display/PicoGraphics objects.
+  - `_handle_client()`: HTTP server on port 80 — serves `index.html` from flash, handles WebSocket upgrades.
+  - `_ws_broadcast_task()`: Broadcasts new ECG samples to connected WebSocket clients at ~20Hz.
+
+WiFi Access Point: SSID `ECG-Monitor`, password `ecg12345`, WPA2. Phone connects and opens `http://192.168.4.1`. Max 2 concurrent WebSocket clients.
+
+Web UI (`pico2w-display/index.html`): Stripped-down version of `Software/static/index.html` — same canvas ECG rendering (grid, multi-row trace, minimap, scroll/zoom, BPM labels) but without events panel, event viewer, recording, arrhythmia markers, or history requests. Uses a compact WebSocket protocol: `init` message has `{type, bpm, buf}`, data messages have `{type, ts, lo, bpm, b[], v[]}` where `v` is raw ADC values and `b` is beat offset indices.
 
 Cross-core contract: Core 0 writes `wave_buf`, `wave_idx`, `current_value`, `leads_off_flag`. Core 1 reads these. No locks — relies on atomic scalar writes and tolerates occasional torn reads.
 
-Wiring: AD8232 OUTPUT→GP26, LO+→GP2, LO-→GP3. Button A cycles display pages, Button B toggles backlight. PVC events logged to `/pvc_events.jsonl` on flash.
+Wiring: AD8232 OUTPUT→GP26, LO+→GP2, LO-→GP3. Button A cycles display pages, Button B toggles backlight. PVC detection is display-flash only (no file I/O).
 
-`main_bare.py` is a minimal variant (no display, no BPM — raw ADC only).
+`main_simple.py` is the previous version without WiFi (display + PVC file logging only). `main_bare.py` is a minimal variant (no display, no BPM — raw ADC only).
 
 ## Build & Run
 
@@ -57,16 +66,16 @@ Wiring: AD8232 OUTPUT→GP26, LO+→GP2, LO-→GP3. Button A cycles display page
 
 **Processing sketch**: Open `.pde` in Processing IDE (Java mode), run. Adjust `Serial.list()` index for your system.
 
-**Python web server**:
+**Python web server** (dependencies: `aiohttp`, `pyserial-asyncio` — no requirements.txt, installed by run.sh):
 ```bash
 Software/run.sh                    # creates venv, installs deps, starts server
 # or manually:
 pip install aiohttp pyserial-asyncio
 python Software/ecg_server.py --serial /dev/ttyACM0 --port 8080 --baud 9600
 ```
-Open `http://localhost:8080` in browser. CLI args also settable via env vars: `ECG_PORT`, `ECG_SERIAL_PORT`, `ECG_SERIAL_BAUD`.
+Open `http://localhost:8080` in browser. CLI args also settable via env vars: `ECG_PORT`, `ECG_SERIAL_PORT`, `ECG_SERIAL_BAUD`. Data directories (`Software/ecg_data/` and `events/` subdirectory) are created automatically on first recording.
 
-**Pico 2W**: Copy `pico2w-display/boot.py` and `main.py` to the Pico 2W filesystem (requires Pimoroni MicroPython build with `picographics` module).
+**Pico 2W**: Copy `pico2w-display/boot.py`, `main.py`, and `index.html` to the Pico 2W filesystem (requires Pimoroni MicroPython build with `picographics` module). The `index.html` must be at `/index.html` on the Pico flash for the web server to serve it.
 
 **No tests or linters are configured.** This is a hardware-dependent project — all components require physical AD8232 sensor hardware or a serial device to function.
 
@@ -80,7 +89,8 @@ Unidirectional MCU→host. ASCII newline-terminated: integer `0`–`1023` (ADC r
 - **Serial port**: `Serial.list()[2]` in Processing; `--serial` flag or `ECG_SERIAL_PORT` env var for Python server
 - **Arrhythmia detection**: 30% R-R deviation, 10-beat baseline window, 5s cooldown between events (constants at top of `ecg_server.py`)
 - **Pico 2W pins**: ADC0=GP26, LO+=GP2, LO-=GP3, display on GP6-8/GP12-20
-- **Pico 2W MicroPython constraints**: No standard library beyond `machine`/`time`/`sys`/`_thread`/`array`. Prefer integer math. Memory-constrained (~190KB heap). `picographics` is from Pimoroni's custom firmware.
+- **Pico 2W WiFi AP**: SSID `ECG-Monitor`, password `ecg12345`, WPA2 (security=4). Constants at top of `main.py`. Web server on port 80, max 2 WebSocket clients, 20Hz broadcast.
+- **Pico 2W MicroPython constraints**: No standard library beyond `machine`/`time`/`sys`/`_thread`/`array`/`asyncio`/`network`/`hashlib`/`binascii`. Prefer integer math. Memory-constrained (~190KB heap, ~140KB free with WiFi active). `picographics` is from Pimoroni's custom firmware.
 
 ## Data Storage Formats
 
@@ -88,7 +98,7 @@ Unidirectional MCU→host. ASCII newline-terminated: integer `0`–`1023` (ADC r
 
 **Event JSON** (`Software/ecg_data/events/event_YYYYMMDD_HHMMSS_{type}.json`): Contains `version`, `type` (pause/premature/manual), `baseline_rr_ms`, `anomalous_beats` array, and raw `samples` array with format `[timestamp_ms, raw_value, leads_off, bpm_or_null]`.
 
-**Pico PVC log** (`/pvc_events.jsonl` on flash): JSONL with `v`, `t_ms`, `bpm`, and `samples` array (raw ADC values only, ~2000 samples per event).
+**Pico PVC log** (legacy, `main_simple.py` only — `/pvc_events.jsonl` on flash): JSONL with `v`, `t_ms`, `bpm`, and `samples` array (raw ADC values only, ~2000 samples per event). The WiFi-enabled `main.py` does not write PVC events to flash.
 
 ## ECG Rendering Standards
 

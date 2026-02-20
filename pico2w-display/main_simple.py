@@ -1,19 +1,8 @@
-"""AD8232 ECG Serial Sender + Pico Display + WiFi Web Server — Pico 2W.
+"""AD8232 ECG Serial Sender + Pico Display — Raspberry Pi Pico 2W.
 
 Dual-core architecture:
-    Core 0 (main loop):
-        - ADC read + serial at ~1kHz
-        - Non-blocking poll for HTTP connections (raw sockets, no asyncio)
-        - SSE broadcast every ~50ms
-    Core 1 (display_thread):
-        - BPM detection + display rendering at ~5Hz
-
-Networking uses raw sockets polled from Core 0's main loop.
-No asyncio — maximum compatibility with all MicroPython builds.
-
-WiFi Station mode:
-    Connects to phone hotspot (configure WIFI_SSID / WIFI_PASSWORD)
-    Open http://<assigned-ip> from any device on the same network
+    Core 0: ADC read + serial send at ~1kHz (lean — no computation)
+    Core 1: BPM detection + display rendering at ~5Hz (reads shared buffer)
 
 Serial protocol (unchanged — compatible with ecg_server.py):
     - Integer 0-1023 + newline   — normal ADC reading
@@ -38,35 +27,25 @@ Button B: toggle backlight on/off
 import sys
 import time
 import _thread
-import socket
 from array import array
 from machine import ADC, Pin
 
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY
 
 # ---------------------------------------------------------------------------
-# WiFi AP configuration
+# Pin configuration  (Core 0 owns the ADC — Core 1 never touches it)
 # ---------------------------------------------------------------------------
 
-WIFI_SSID = "danix"
-WIFI_PASSWORD = "12345678"
-WEB_PORT = 80
-MAX_SSE_CLIENTS = 2
-SERIAL_PRINT_EVERY = 10      # print every Nth sample (0 = disable serial ADC output)
-
-# ---------------------------------------------------------------------------
-# Pin configuration
-# ---------------------------------------------------------------------------
-
-adc = ADC(Pin(26))
-lo_plus = Pin(2, Pin.IN, Pin.PULL_DOWN)
-lo_minus = Pin(3, Pin.IN, Pin.PULL_DOWN)
+adc = ADC(Pin(26))                         # AD8232 analog output
+lo_plus = Pin(2, Pin.IN, Pin.PULL_DOWN)    # AD8232 LO+
+lo_minus = Pin(3, Pin.IN, Pin.PULL_DOWN)   # AD8232 LO-
 
 # ---------------------------------------------------------------------------
 # Shared state — written by Core 0, read by Core 1
+# All are simple scalars or pre-allocated arrays (no cross-core contention).
 # ---------------------------------------------------------------------------
 
-WAVE_COMPRESS = 3
+WAVE_COMPRESS = 16
 WAVE_LEN = 240 * WAVE_COMPRESS            # 3840 samples in ring buffer (~4 s)
 wave_buf = array("H", (512 for _ in range(WAVE_LEN)))
 wave_idx = 0
@@ -81,7 +60,7 @@ leads_off_flag = False
 
 display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, rotate=0)
 display.set_backlight(0.8)
-WIDTH, HEIGHT = display.get_bounds()
+WIDTH, HEIGHT = display.get_bounds()       # 240 x 135
 
 btn_a = Pin(12, Pin.IN, Pin.PULL_UP)
 btn_b = Pin(13, Pin.IN, Pin.PULL_UP)
@@ -93,22 +72,19 @@ GREEN = display.create_pen(0, 200, 0)
 YELLOW = display.create_pen(255, 200, 0)
 GREY = display.create_pen(50, 50, 50)
 
-DEAD_TOP = 14
+DEAD_TOP = 14                              # skip defective top 10%
 
 # ---------------------------------------------------------------------------
-# PVC display state (no file I/O — display flash only)
+# PVC event logging to flash
 # ---------------------------------------------------------------------------
 
+PVC_FILE = "/pvc_events.jsonl"
+PVC_SAMPLES = 2000                         # ~2 s of waveform context
+MAX_PVC_EVENTS = 150                       # cap per session (~1.2 MB)
 pvc_event_flag = False
 pvc_event_ts = 0
-pvc_show_until = 0
-
-# ---------------------------------------------------------------------------
-# SSE state
-# ---------------------------------------------------------------------------
-
-sse_clients = []             # [{'s': socket, 'li': last_sent_wave_idx, 'init': False}, ...]
-beat_broadcast_idxs = []     # wave_buf indices where beats detected
+pvc_event_count = 0
+pvc_show_until = 0                         # ticks_ms — flash "PVC" on display
 
 # ---------------------------------------------------------------------------
 # BPM detection  (called from Core 1 display thread)
@@ -161,7 +137,7 @@ def _recompute_threshold():
         pvc_rearm = p50 + int(0.05 * range_down)
 
 
-def _detect_beat(value, ts, buf_idx):
+def _detect_beat(value, ts):
     global below_threshold, last_beat_ms, last_beat_rearm_ms, _bpm
     global thresh_idx, thresh_fill, thresh_counter, current_bpm
     global pvc_armed, pvc_event_flag, pvc_event_ts
@@ -187,6 +163,7 @@ def _detect_beat(value, ts, buf_idx):
         pvc_hit = value > pvc_threshold and pvc_armed
         pvc_reset_cond = value < pvc_rearm
 
+    # PVC detection (opposite-direction spike — not counted as beat)
     if pvc_hit:
         pvc_armed = False
         pvc_event_flag = True
@@ -194,6 +171,7 @@ def _detect_beat(value, ts, buf_idx):
     elif pvc_reset_cond:
         pvc_armed = True
 
+    # Normal beat detection
     if beat_hit:
         below_threshold = not peaks_go_up
         last_beat_rearm_ms = ts
@@ -206,23 +184,53 @@ def _detect_beat(value, ts, buf_idx):
                     recent_bpms.pop(0)
                 current_bpm = sum(recent_bpms) // len(recent_bpms)
         last_beat_ms = ts
-        if len(beat_broadcast_idxs) < 10:
-            beat_broadcast_idxs.append(buf_idx)
     elif reset_cond:
         if time.ticks_diff(ts, last_beat_rearm_ms) > REFRACTORY_MS:
             below_threshold = peaks_go_up
 
 
+def _save_pvc_event(ts, widx):
+    """Append one PVC event (metadata + waveform snippet) to flash."""
+    global pvc_event_count
+    if pvc_event_count >= MAX_PVC_EVENTS:
+        return
+    try:
+        with open(PVC_FILE, "a") as f:
+            f.write('{"v":1,"t_ms":%d,"bpm":%d,"samples":[' % (ts, current_bpm))
+            start = (widx - PVC_SAMPLES) % WAVE_LEN
+            CHUNK = 200
+            for c in range(0, PVC_SAMPLES, CHUNK):
+                end = min(c + CHUNK, PVC_SAMPLES)
+                if c > 0:
+                    f.write(',')
+                f.write(','.join(
+                    str(wave_buf[(start + i) % WAVE_LEN])
+                    for i in range(c, end)
+                ))
+            f.write(']}\n')
+        pvc_event_count += 1
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
-# Core 1 — Display + BPM  (blocking loop, NO networking)
+# Core 1 — Display + BPM thread  (never touches ADC, never blocks serial)
 # ---------------------------------------------------------------------------
 
 
 def _draw_waveform(x0, y0, w, h, widx):
+    """Draw min-max compressed ECG waveform from shared ring buffer.
+
+    For each pixel column, tracks both the min and max sample values in
+    the group and draws a vertical line spanning both.  This guarantees
+    deep QRS spikes (low peaks) are always visible regardless of
+    compression level.
+    """
     display.set_pen(GREY)
     mid = y0 + (h >> 1)
     display.line(x0, mid, x0 + w - 1, mid)
 
+    # Compute baseline (midpoint of min/max) and range
     vmin = 65535
     vmax = 0
     for k in range(WAVE_LEN):
@@ -235,12 +243,12 @@ def _draw_waveform(x0, y0, w, h, widx):
     vrange = vmax - vmin
     if vrange < 30:
         vrange = 30
-    vrange = vrange + (vrange * 2 // 5)
+    vrange = vrange + (vrange * 2 // 5)   # 40% padding
 
     half_h = h >> 1
 
     def _v2y(v):
-        py = y0 + (v - baseline) * h // vrange + half_h
+        py = y0 + h - ((v - baseline) * h // vrange + half_h)
         if py < y0:
             return y0
         if py > y0 + h:
@@ -249,6 +257,7 @@ def _draw_waveform(x0, y0, w, h, widx):
 
     display.set_pen(RED)
 
+    # First pixel group — find min/max
     v0 = wave_buf[widx % WAVE_LEN]
     gmin = v0
     gmax = v0
@@ -261,6 +270,7 @@ def _draw_waveform(x0, y0, w, h, widx):
     prev_ylo = _v2y(gmin)
     prev_yhi = _v2y(gmax)
     prev_x = x0
+    # Draw vertical span for first column
     if prev_ylo != prev_yhi:
         display.line(prev_x, prev_yhi, prev_x, prev_ylo)
 
@@ -278,8 +288,10 @@ def _draw_waveform(x0, y0, w, h, widx):
         ylo = _v2y(gmin)
         yhi = _v2y(gmax)
         px = x0 + i
+        # Connect to previous column
         display.line(prev_x, prev_ylo, px, ylo)
         display.line(prev_x, prev_yhi, px, yhi)
+        # Draw vertical span for this column (fills in the spike)
         if ylo != yhi:
             display.line(px, yhi, px, ylo)
         prev_x = px
@@ -288,16 +300,27 @@ def _draw_waveform(x0, y0, w, h, widx):
 
 
 def display_thread():
-    global pvc_show_until, pvc_event_flag
+    """Runs on Core 1.  Renders display at ~5 Hz + BPM detection."""
+    global pvc_show_until
     display_page = 0
     backlight_on = True
     btn_a_last = 0
     btn_b_last = 0
-    bpm_read_idx = 0
+    bpm_read_idx = 0       # Core 1's read position in wave_buf
+
+    # Splash
+    display.set_pen(BLACK)
+    display.clear()
+    display.set_pen(RED)
+    display.text("AD8232 ECG", 30, DEAD_TOP + 20, scale=3)
+    display.set_pen(GREY)
+    display.text("Waiting...", 50, DEAD_TOP + 56, scale=2)
+    display.update()
 
     while True:
         ts = time.ticks_ms()
 
+        # Buttons
         if btn_a.value() == 0 and time.ticks_diff(ts, btn_a_last) > 250:
             btn_a_last = ts
             display_page = (display_page + 1) % 2
@@ -306,43 +329,57 @@ def display_thread():
             backlight_on = not backlight_on
             display.set_backlight(0.8 if backlight_on else 0.0)
 
+        # Screen off — skip all work, let Core 0 have maximum CPU
         if not backlight_on:
-            bpm_read_idx = wave_idx
+            bpm_read_idx = wave_idx   # stay caught up so we don't process stale data on wake
             time.sleep_ms(200)
             continue
 
+        # Snapshot the write index (Core 0 may advance it, that's fine)
         widx = wave_idx
 
+        # ---- Process new samples for BPM (moved from Core 0) ----
         if not leads_off_flag:
             if widx >= bpm_read_idx:
                 new_count = widx - bpm_read_idx
             else:
                 new_count = WAVE_LEN - bpm_read_idx + widx
+
             if new_count > WAVE_LEN:
-                new_count = WAVE_LEN
+                new_count = WAVE_LEN  # overflow guard
+
             if new_count > 1000:
+                # Stale data (leads were off or major gap) — skip
                 bpm_read_idx = widx
             else:
                 for i in range(new_count):
                     idx = (bpm_read_idx + i) % WAVE_LEN
                     val = wave_buf[idx]
-                    sample_ts = ts - (new_count - 1 - i)
-                    _detect_beat(val, sample_ts, idx)
+                    sample_ts = ts - (new_count - 1 - i)  # ~1ms per sample
+                    _detect_beat(val, sample_ts)
                 bpm_read_idx = widx
         else:
+            # Leads off — skip over these samples, don't pollute threshold
             bpm_read_idx = widx
 
         display.set_pen(BLACK)
         display.clear()
 
         DT = DEAD_TOP
+
+        # PVC flash indicator (shared across pages)
         show_pvc = time.ticks_diff(pvc_show_until, ts) > 0
 
         if display_page == 0:
+            # Row 0 (y=2): PVC flash + event count
             if show_pvc:
                 display.set_pen(YELLOW)
                 display.text("PVC", 2, 2, scale=2)
+            if pvc_event_count > 0:
+                display.set_pen(YELLOW if show_pvc else GREY)
+                display.text(str(pvc_event_count), 55, 6, scale=1)
 
+            # Row 1 (y=DT+2): ECG label + BPM
             wave_top = DT + 22
             wave_h = HEIGHT - wave_top - 2
 
@@ -387,298 +424,47 @@ def display_thread():
 
         display.update()
 
+        # Save PVC event to flash if pending
         if pvc_event_flag:
             pvc_event_flag = False
-            pvc_show_until = ts + 2000
+            pvc_show_until = ts + 2000     # flash for 2 s
+            _save_pvc_event(pvc_event_ts, widx)
 
-        time.sleep_ms(200)
-
-
-# ---------------------------------------------------------------------------
-# HTTP + SSE helpers  (synchronous raw sockets — no asyncio)
-# ---------------------------------------------------------------------------
-
-
-def _handle_http(cl):
-    """Handle one incoming HTTP connection synchronously.
-
-    For GET / — serve index.html and close.
-    For GET /events — start SSE stream (socket stays open for broadcast).
-    """
-    cl.settimeout(5)
-    try:
-        raw = cl.recv(1024)
-        if not raw:
-            cl.close()
-            return
-
-        # Parse request line
-        first_line_end = raw.find(b"\r\n")
-        if first_line_end < 0:
-            cl.close()
-            return
-        req_line = raw[:first_line_end]
-        parts = req_line.split(b" ")
-        path = parts[1] if len(parts) >= 2 else b"/"
-
-        sys.stdout.write("HTTP %s\n" % path.decode())
-
-        # --- SSE endpoint ---
-        if path == b"/events":
-            if len(sse_clients) >= MAX_SSE_CLIENTS:
-                cl.send(b"HTTP/1.1 503 Too Many Clients\r\nConnection: close\r\n\r\n")
-                cl.close()
-                return
-
-            cl.sendall(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/event-stream\r\n"
-                b"Cache-Control: no-cache\r\n"
-                b"Connection: keep-alive\r\n"
-                b"Access-Control-Allow-Origin: *\r\n\r\n"
-            )
-            cl.settimeout(0.1)
-            sse_clients.append({"s": cl, "li": wave_idx, "init": True})
-            sys.stdout.write("SSE+ (%d)\n" % len(sse_clients))
-            return  # socket stays open
-
-        # --- Serve index.html ---
-        if path == b"/" or path == b"/index.html":
-            try:
-                cl.sendall(
-                    b"HTTP/1.0 200 OK\r\n"
-                    b"Content-Type: text/html; charset=utf-8\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
-                with open("/index.html", "rb") as f:
-                    while True:
-                        chunk = f.read(512)
-                        if not chunk:
-                            break
-                        cl.sendall(chunk)
-            except OSError:
-                cl.send(b"HTTP/1.0 404 Not Found\r\n\r\nindex.html not found")
-            cl.close()
-            return
-
-        # --- Favicon (browsers request this) ---
-        if path == b"/favicon.ico":
-            cl.send(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-            cl.close()
-            return
-
-        # --- 404 ---
-        cl.send(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n404")
-        cl.close()
-
-    except Exception as e:
-        sys.stdout.write("HTTP err: %s\n" % str(e))
-        try:
-            cl.close()
-        except Exception:
-            pass
-
-
-def _sse_broadcast():
-    """Send new ECG samples to all SSE clients. Called every ~50ms."""
-    if not sse_clients:
-        beat_broadcast_idxs.clear()
-        return
-
-    widx = wave_idx
-    ts = time.ticks_ms()
-    lo = 1 if leads_off_flag else 0
-    bpm = current_bpm
-
-    dead = []
-    for client in sse_clients:
-        # Send init event on first broadcast
-        if client.get("init"):
-            client["init"] = False
-            init_msg = 'data: {"type":"init","bpm":%d,"buf":%d}\n\n' % (bpm, WAVE_LEN)
-            try:
-                client["s"].sendall(init_msg.encode())
-            except Exception:
-                dead.append(client)
-                continue
-
-        li = client["li"]
-        if widx >= li:
-            count = widx - li
-        else:
-            count = WAVE_LEN - li + widx
-
-        if count > WAVE_LEN:
-            count = WAVE_LEN
-        if count == 0:
-            continue
-        if count > 500:
-            client["li"] = widx
-            continue
-
-        vals = []
-        for i in range(count):
-            vals.append(str(wave_buf[(li + i) % WAVE_LEN]))
-        client["li"] = widx
-
-        beats = []
-        for bidx in beat_broadcast_idxs:
-            if bidx >= li:
-                offset = bidx - li
-            else:
-                offset = WAVE_LEN - li + bidx
-            if 0 <= offset < count:
-                beats.append(str(offset))
-
-        msg = 'data: {"type":"d","ts":%d,"lo":%d,"bpm":%d,"b":[%s],"v":[%s]}\n\n' % (
-            ts, lo, bpm, ",".join(beats), ",".join(vals)
-        )
-
-        try:
-            client["s"].sendall(msg.encode())
-        except Exception:
-            dead.append(client)
-
-    for d in dead:
-        if d in sse_clients:
-            sse_clients.remove(d)
-            sys.stdout.write("SSE- (%d)\n" % len(sse_clients))
-            try:
-                d["s"].close()
-            except Exception:
-                pass
-
-    beat_broadcast_idxs.clear()
+        time.sleep_ms(200)         # 5 Hz is plenty for the display
 
 
 # ---------------------------------------------------------------------------
-# Core 0 — main loop: ADC + serial + HTTP poll + SSE broadcast
+# Core 0 — ADC + serial  (lean — identical to main_bare.py + ring buffer)
 # ---------------------------------------------------------------------------
 
 
 def main():
     global current_value, leads_off_flag, wave_idx
 
-    # ---- WiFi STA setup — connect to phone hotspot ----
-    global _wlan
-    wifi_ok = False
-    wifi_ip = "0.0.0.0"
+    # Write session marker to PVC event log
     try:
-        import network
-        wlan = network.WLAN(network.STA_IF)
-        wlan.active(True)
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        sys.stdout.write("Connecting to %s...\n" % WIFI_SSID)
+        with open(PVC_FILE, "a") as f:
+            f.write('{"v":1,"type":"session","t_ms":0}\n')
+    except OSError:
+        pass
 
-        # Show connecting status on display
-        display.set_pen(BLACK)
-        display.clear()
-        display.set_pen(RED)
-        display.text("AD8232 ECG", 30, DEAD_TOP + 10, scale=3)
-        display.set_pen(YELLOW)
-        display.text("WiFi: " + WIFI_SSID, 10, DEAD_TOP + 46, scale=2)
-        display.set_pen(WHITE)
-        display.text("Connecting...", 30, DEAD_TOP + 72, scale=2)
-        display.update()
-
-        for attempt in range(30):
-            if wlan.isconnected():
-                break
-            time.sleep(1)
-            # Update dots on display
-            display.set_pen(BLACK)
-            display.rectangle(30, DEAD_TOP + 72, 200, 20)
-            display.set_pen(WHITE)
-            display.text("Connecting" + "." * ((attempt % 3) + 1), 30, DEAD_TOP + 72, scale=2)
-            display.update()
-        wifi_ok = wlan.isconnected()
-        if wifi_ok:
-            ifc = wlan.ifconfig()
-            wifi_ip = ifc[0]
-            sys.stdout.write("Connected! IP: %s\n" % wifi_ip)
-            _wlan = wlan  # prevent GC
-        else:
-            sys.stdout.write("WiFi FAILED status: %d\n" % wlan.status())
-    except Exception as e:
-        sys.stdout.write("WiFi err: %s\n" % str(e))
-        wifi_ok = False
-
-    # Splash screen
-    display.set_pen(BLACK)
-    display.clear()
-    display.set_pen(RED)
-    display.text("AD8232 ECG", 30, DEAD_TOP + 10, scale=3)
-    if wifi_ok:
-        display.set_pen(GREEN)
-        display.text("on " + WIFI_SSID, 10, DEAD_TOP + 46, scale=2)
-        display.set_pen(WHITE)
-        display.text("http://" + wifi_ip, 4, DEAD_TOP + 70, scale=2)
-    else:
-        display.set_pen(YELLOW)
-        display.text("WiFi FAILED", 30, DEAD_TOP + 46, scale=2)
-        display.set_pen(GREY)
-        display.text("Display only", 40, DEAD_TOP + 72, scale=1)
-    display.update()
-    time.sleep_ms(2000)
-
-    # ---- HTTP server socket ----
-    srv = None
-    if wifi_ok:
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("0.0.0.0", WEB_PORT))
-            srv.listen(2)
-            # Use short timeout instead of non-blocking — gives WiFi stack
-            # processing time inside accept() when no clients are connecting
-            srv.settimeout(0.01)
-            sys.stdout.write("HTTP server on :%d\n" % WEB_PORT)
-        except Exception as e:
-            sys.stdout.write("Server err: %s\n" % str(e))
-            srv = None
-
-    # Start display + BPM on Core 1
+    # Start display on Core 1
     _thread.start_new_thread(display_thread, ())
 
-    # ---- Core 0 main loop ----
-    sse_counter = 0
-    serial_counter = 0
-
     while True:
-        # ADC read
         if lo_plus.value() == 1 or lo_minus.value() == 1:
             leads_off_flag = True
             current_value = 512
+            sys.stdout.write("!\n")
         else:
             leads_off_flag = False
             current_value = adc.read_u16() >> 6
-
-        # Serial output (reduced frequency to give WiFi more CPU time)
-        serial_counter += 1
-        if SERIAL_PRINT_EVERY > 0 and serial_counter >= SERIAL_PRINT_EVERY:
-            serial_counter = 0
-            if leads_off_flag:
-                sys.stdout.write("!\n")
-            else:
-                sys.stdout.write(str(current_value) + "\n")
+            sys.stdout.write(str(current_value) + "\n")
 
         wave_buf[wave_idx] = current_value
         wave_idx = (wave_idx + 1) % WAVE_LEN
 
-        # Accept new HTTP connections (blocking with 10ms timeout —
-        # this is where CYW43 WiFi driver gets most of its processing time)
-        if srv:
-            try:
-                cl, addr = srv.accept()
-                _handle_http(cl)
-            except OSError:
-                pass  # timeout — no pending connection
-
-        # SSE broadcast every ~50 iterations (~50ms)
-        sse_counter += 1
-        if sse_counter >= 50:
-            sse_counter = 0
-            _sse_broadcast()
+        time.sleep_ms(1)
 
 
 main()

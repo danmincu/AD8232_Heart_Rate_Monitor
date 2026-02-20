@@ -17,39 +17,6 @@ body{background:#111;font-family:system-ui,-apple-system,sans-serif;overflow:hid
   border-radius:3px;cursor:pointer;font-size:11px;font-weight:bold;display:none}
 #lbtn:hover{background:#e94560;color:#fff}
 canvas{display:block;cursor:crosshair}
-/* Events button & panel */
-#evbtn{padding:3px 14px;background:transparent;color:#ffb347;border:1px solid #ffb347;
-  border-radius:3px;cursor:pointer;font-size:11px;font-weight:bold}
-#evbtn:hover{background:#ffb347;color:#111}
-#recbtn{padding:3px 14px;background:transparent;color:#4caf50;border:1px solid #4caf50;
-  border-radius:3px;cursor:pointer;font-size:11px;font-weight:bold}
-#recbtn:hover{background:#4caf50;color:#111}
-#recbeats{width:50px;padding:2px 4px;background:#222;color:#ccc;border:1px solid #555;
-  border-radius:3px;font-size:11px;text-align:center;font-family:monospace}
-#evpanel{display:none;position:absolute;top:42px;right:16px;width:380px;max-height:60vh;
-  background:#1a1a2e;border:1px solid #0f3460;border-radius:6px;overflow-y:auto;z-index:100;
-  box-shadow:0 4px 20px rgba(0,0,0,0.5)}
-#evpanel.open{display:block}
-#evpanel .ev-header{padding:10px 14px;border-bottom:1px solid #0f3460;font-size:13px;
-  color:#888;font-weight:bold}
-.ev-item{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.05);cursor:pointer;
-  display:flex;align-items:center;gap:10px}
-.ev-item:hover{background:rgba(255,255,255,0.05)}
-.ev-type{padding:2px 8px;border-radius:3px;font-size:10px;font-weight:bold;text-transform:uppercase}
-.ev-pause{background:#ff8f00;color:#111}
-.ev-premature{background:#ff5722;color:#fff}
-.ev-manual{background:#4caf50;color:#fff}
-.ev-info{flex:1;font-size:12px;color:#aaa}
-.ev-info .ev-time{color:#ccc;font-weight:bold}
-.ev-empty{padding:20px;text-align:center;color:#555;font-size:13px}
-/* Event viewer overlay */
-#evoverlay{display:none;position:absolute;top:50px;left:16px;background:rgba(26,26,46,0.92);
-  border:1px solid #0f3460;border-radius:6px;padding:12px 16px;z-index:90;font-size:12px;
-  color:#ccc;max-width:340px}
-#evoverlay.open{display:block}
-#evoverlay .evo-title{font-size:15px;font-weight:bold;margin-bottom:6px}
-#evoverlay .ovo-row{margin:3px 0;color:#aaa}
-#evoverlay .ovo-row b{color:#ccc}
 </style>
 </head>
 <body>
@@ -57,13 +24,8 @@ canvas{display:block;cursor:crosshair}
   <span class="bpm" id="bpm">&#9829; -- BPM</span>
   <span class="val" id="val">data: ---</span>
   <button id="lbtn" onclick="window._goLive()">&#9654; LIVE</button>
-  <input id="recbeats" type="number" value="100" min="5" max="500" title="Beats to record">
-  <button id="recbtn" onclick="window._recordEvent()">REC</button>
-  <button id="evbtn" onclick="window._toggleEvents()">Events (0)</button>
   <span class="st err" id="st">&#9679; Connecting</span>
 </div>
-<div id="evpanel"><div class="ev-header">Arrhythmia Events</div><div id="evlist"></div></div>
-<div id="evoverlay"><div class="evo-title" id="evo-title"></div><div id="evo-body"></div></div>
 <canvas id="c"></canvas>
 <script>
 (function(){
@@ -81,7 +43,7 @@ var needsRedraw = true;
 var signalBaseline = -1;
 var signalRange = -1;          // adaptive vertical range (auto-scaled)
 var lastBPMs = [];
-var COMPRESS = 5;              // samples per pixel
+var COMPRESS = 1;              // samples per pixel
 
 /* ---- multi-row layout constants ---- */
 var NUM_ROWS = 4;
@@ -94,13 +56,6 @@ var traceH = 0;
 var rowH = 0;
 var samplesPerRow = 0;
 var totalVisibleSamples = 0;
-
-/* ---- arrhythmia state ---- */
-var arrhythmiaMarkers = [];   // [{sampleIdx, type, filename}]
-var eventViewerMode = false;
-var eventViewerData = null;   // full event JSON when viewing
-var eventCount = 0;
-var liveSamplesBackup = null;
 
 /* ---- minimap interaction ---- */
 var minimapDragging = false;
@@ -216,17 +171,14 @@ function render(){
 
   var visMid = (vmin + vmax) / 2;
   if(signalBaseline < 0) signalBaseline = visMid;
-  else if(!eventViewerMode) signalBaseline = signalBaseline * 0.90 + visMid * 0.10;
-  else signalBaseline = visMid;
+  else signalBaseline = signalBaseline * 0.90 + visMid * 0.10;
 
   var visRange = Math.max(vmax - vmin, 30) * 1.3;
   if(signalRange < 0){
     signalRange = visRange;
-  } else if(!eventViewerMode){
+  } else {
     if(visRange > signalRange) signalRange = signalRange * 0.3 + visRange * 0.7;
     else                       signalRange = signalRange * 0.98 + visRange * 0.02;
-  } else {
-    signalRange = visRange;
   }
 
   /* ---- Row loop ---- */
@@ -243,67 +195,6 @@ function render(){
 
     var rowCount = rowEndIdx - rowStartIdx;
     var xOff = 0; /* left-align like medical ECG strip chart */
-
-    /* Arrhythmia markers — vertical bands scoped to row */
-    if(!eventViewerMode){
-      for(var mi = 0; mi < arrhythmiaMarkers.length; mi++){
-        var marker = arrhythmiaMarkers[mi];
-        if(marker.sampleIdx < rowStartIdx || marker.sampleIdx >= rowEndIdx) continue;
-        var mx = Math.round((marker.sampleIdx - rowStartIdx) / COMPRESS) + xOff;
-        if(mx >= 0 && mx < w){
-          var mcolor = marker.type === "pause" ? "rgba(255,143,0,0.25)"
-                     : marker.type === "premature" ? "rgba(255,87,34,0.25)"
-                     : "rgba(76,175,80,0.25)";
-          ctx.fillStyle = mcolor;
-          ctx.fillRect(mx - 15, rowTop, 30, rowH);
-          ctx.font = "bold 11px sans-serif";
-          ctx.fillStyle = marker.type === "pause" ? "#ff8f00"
-                        : marker.type === "premature" ? "#ff5722" : "#4caf50";
-          var label = marker.type === "pause" ? "PAUSE"
-                    : marker.type === "premature" ? "PVC" : "REC";
-          ctx.fillText(label, mx - 12, rowTop + rowH - 18);
-        }
-      }
-    }
-
-    /* Event viewer: highlight anomalous beat regions within this row */
-    if(eventViewerMode && eventViewerData && eventViewerData.anomalous_beats && eventViewerData.anomalous_beats.length > 0){
-      var beatPositions = [];
-      for(var bi = rowStartIdx; bi < rowEndIdx; bi++){
-        if(samples[bi][3] !== null && samples[bi][3] !== undefined){
-          beatPositions.push(bi);
-        }
-      }
-      var anomCount = eventViewerData.anomalous_beats.length;
-      if(beatPositions.length > 0){
-        /* Check if anomalous region overlaps this row */
-        /* Find all beat positions across full visible range to locate anomalous region */
-        var allBeatPos = [];
-        for(var abi = startIdx; abi < endIdx; abi++){
-          if(samples[abi][3] !== null && samples[abi][3] !== undefined){
-            allBeatPos.push(abi);
-          }
-        }
-        var hlStart = Math.max(0, allBeatPos.length - anomCount - 5);
-        var hlEnd = Math.min(allBeatPos.length, hlStart + anomCount + 2);
-        if(hlStart < allBeatPos.length && hlEnd > 0){
-          var hlSampleStart = allBeatPos[hlStart];
-          var hlSampleEnd = allBeatPos[Math.min(hlEnd, allBeatPos.length - 1)];
-          /* Check overlap with this row's range */
-          if(hlSampleEnd >= rowStartIdx && hlSampleStart < rowEndIdx){
-            var clampStart = Math.max(hlSampleStart, rowStartIdx);
-            var clampEnd = Math.min(hlSampleEnd, rowEndIdx - 1);
-            var hlX1 = Math.round((clampStart - rowStartIdx) / COMPRESS) + xOff;
-            var hlX2 = Math.round((clampEnd - rowStartIdx) / COMPRESS) + xOff;
-            var hlColor = eventViewerData.type === "pause" ? "rgba(255,143,0,0.15)"
-                        : eventViewerData.type === "premature" ? "rgba(255,87,34,0.15)"
-                        : "rgba(76,175,80,0.15)";
-            ctx.fillStyle = hlColor;
-            ctx.fillRect(hlX1, rowTop, Math.max(hlX2 - hlX1, 20), rowH);
-          }
-        }
-      }
-    }
 
     /* ECG trace for this row */
     ctx.save();
@@ -365,13 +256,6 @@ function render(){
   ctx.font = "11px sans-serif";
   ctx.fillStyle = "rgba(0,0,0,0.45)";
   ctx.fillText("25 mm/s  10 mm/mV", 10, traceH - 6);
-
-  /* Event viewer mode label */
-  if(eventViewerMode){
-    ctx.font = "bold 16px sans-serif";
-    ctx.fillStyle = "rgba(233,69,96,0.8)";
-    ctx.fillText("EVENT VIEWER", w - 160, 26);
-  }
 
   /* ---- minimap ---- */
   drawMinimap();
@@ -479,9 +363,8 @@ function minimapJump(clientX){
   newOffset = Math.round(Math.max(0, Math.min(newOffset, Math.max(0, n - totalVisibleSamples))));
 
   viewOffset = newOffset;
-  isLive = (viewOffset === 0) && !eventViewerMode;
-  document.getElementById("lbtn").style.display = (isLive && !eventViewerMode) ? "none" : "inline-block";
-  if(eventViewerMode) document.getElementById("lbtn").textContent = "EXIT VIEWER";
+  isLive = (viewOffset === 0);
+  document.getElementById("lbtn").style.display = isLive ? "none" : "inline-block";
   needsRedraw = true;
 }
 
@@ -544,17 +427,12 @@ canvas.addEventListener("wheel", function(e){
     viewOffset - delta,
     Math.max(0, samples.length - totalVisibleSamples)
   )));
-  isLive = (viewOffset === 0) && !eventViewerMode;
-  document.getElementById("lbtn").style.display = (isLive && !eventViewerMode) ? "none" : "inline-block";
-  if(eventViewerMode) document.getElementById("lbtn").textContent = "EXIT VIEWER";
+  isLive = (viewOffset === 0);
+  document.getElementById("lbtn").style.display = isLive ? "none" : "inline-block";
   needsRedraw = true;
 }, {passive: false});
 
 window._goLive = function(){
-  if(eventViewerMode){
-    _exitViewer();
-    return;
-  }
   viewOffset = 0; isLive = true;
   document.getElementById("lbtn").style.display = "none";
   needsRedraw = true;
@@ -576,216 +454,69 @@ function updateBPMBar(){
   document.getElementById("bpm").textContent = display;
 }
 
-/* ---- events panel ---- */
-window._toggleEvents = function(){
-  var panel = document.getElementById("evpanel");
-  panel.classList.toggle("open");
-  if(panel.classList.contains("open")) _fetchEvents();
-};
-
-function _fetchEvents(){
-  fetch("/api/events").then(function(r){ return r.json(); }).then(function(evts){
-    var list = document.getElementById("evlist");
-    if(evts.length === 0){
-      list.innerHTML = '<div class="ev-empty">No events recorded yet</div>';
-      return;
-    }
-    var html = "";
-    for(var i = 0; i < evts.length; i++){
-      var ev = evts[i];
-      var cls = ev.type === "pause" ? "ev-pause"
-              : ev.type === "premature" ? "ev-premature" : "ev-manual";
-      html += '<div class="ev-item" onclick="window._viewEvent(\'' + ev.filename + '\')">'
-            + '<span class="ev-type ' + cls + '">' + ev.type + '</span>'
-            + '<div class="ev-info"><div class="ev-time">' + ev.detected_at + '</div>'
-            + ev.anomalous_beat_count + ' anom. beats | ' + ev.sample_count + ' samples</div></div>';
-    }
-    list.innerHTML = html;
-  }).catch(function(){});
-}
-
-/* ---- event viewer ---- */
-window._viewEvent = function(filename){
-  fetch("/api/events/" + filename).then(function(r){ return r.json(); }).then(function(data){
-    if(data.error) return;
-    /* Close events panel */
-    document.getElementById("evpanel").classList.remove("open");
-    /* Backup live state */
-    if(!eventViewerMode){
-      liveSamplesBackup = samples.slice();
-    }
-    eventViewerMode = true;
-    eventViewerData = data;
-    samples = data.samples || [];
-    viewOffset = 0;
-    isLive = false;
-    signalBaseline = -1;
-    signalRange = -1;
-    needsRedraw = true;
-
-    /* Show exit button */
-    var lbtn = document.getElementById("lbtn");
-    lbtn.textContent = "EXIT VIEWER";
-    lbtn.style.display = "inline-block";
-
-    /* Show info overlay */
-    var overlay = document.getElementById("evoverlay");
-    overlay.classList.add("open");
-    document.getElementById("evo-title").textContent =
-      (data.type === "pause" ? "Pause Event" : data.type === "premature" ? "PVC Event" : "Manual Recording");
-    var bodyHtml = '<div class="ovo-row"><b>Time:</b> ' + (data.detected_at_iso || "") + '</div>'
-      + '<div class="ovo-row"><b>Baseline R-R:</b> ' + data.baseline_rr_ms + ' ms</div>'
-      + '<div class="ovo-row"><b>Anomalous beats:</b> ' + (data.anomalous_beats ? data.anomalous_beats.length : 0) + '</div>';
-    if(data.anomalous_beats){
-      for(var ab = 0; ab < data.anomalous_beats.length; ab++){
-        bodyHtml += '<div class="ovo-row">  R-R ' + data.anomalous_beats[ab].rr_ms
-          + 'ms (' + (data.anomalous_beats[ab].deviation_pct > 0 ? '+' : '')
-          + data.anomalous_beats[ab].deviation_pct + '%)</div>';
-      }
-    }
-    document.getElementById("evo-body").innerHTML = bodyHtml;
-  }).catch(function(){});
-};
-
-function _exitViewer(){
-  eventViewerMode = false;
-  eventViewerData = null;
-  document.getElementById("evoverlay").classList.remove("open");
-  if(liveSamplesBackup){
-    samples = liveSamplesBackup;
-    liveSamplesBackup = null;
-  }
-  viewOffset = 0;
-  isLive = true;
-  signalBaseline = -1;
-  signalRange = -1;
-  var lbtn = document.getElementById("lbtn");
-  lbtn.textContent = "\u25b6 LIVE";
-  lbtn.style.display = "none";
-  needsRedraw = true;
-}
-
-/* ---- manual record ---- */
-window._recordEvent = function(){
-  var beats = parseInt(document.getElementById("recbeats").value) || 100;
-  fetch("/api/record-event", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({beats: beats})
-  }).then(function(r){ return r.json(); }).then(function(data){
-    if(data.ok){
-      var btn = document.getElementById("recbtn");
-      btn.textContent = "SAVED!";
-      setTimeout(function(){ btn.textContent = "REC"; }, 1500);
-    }
-  }).catch(function(){});
-};
-
-/* ---- check URL param for direct event view ---- */
-function checkEventParam(){
-  var params = new URLSearchParams(window.location.search);
-  var evFile = params.get("event");
-  if(evFile) window._viewEvent(evFile);
-}
-
-/* ---- websocket ---- */
+/* ---- SSE (Server-Sent Events) ---- */
 function connect(){
-  var proto = (location.protocol === "https:") ? "wss:" : "ws:";
-  var ws = new WebSocket(proto + "//" + location.host + "/ws");
+  var es = new EventSource("/events");
 
-  ws.onopen = function(){
+  es.onopen = function(){
     document.getElementById("st").textContent = "\u25cf Connected";
     document.getElementById("st").className = "st ok";
   };
 
-  ws.onclose = function(){
-    document.getElementById("st").textContent = "\u25cf Disconnected";
+  es.onerror = function(){
+    document.getElementById("st").textContent = "\u25cf Reconnecting...";
     document.getElementById("st").className = "st err";
-    setTimeout(connect, 2000);
   };
 
-  ws.onerror = function(){ ws.close(); };
-
-  ws.onmessage = function(e){
+  es.onmessage = function(e){
     var msg = JSON.parse(e.data);
 
     if(msg.type === "init"){
-      if(!eventViewerMode){
-        samples = msg.samples || [];
-        signalBaseline = -1;
-        signalRange = -1;
-      }
+      samples = [];
       lastBPMs = [];
-      var initSamples = msg.samples || [];
-      for(var k = 0; k < initSamples.length; k++){
-        if(initSamples[k][3] !== null && initSamples[k][3] !== undefined && initSamples[k][3] > 0){
-          lastBPMs.push(initSamples[k][3]);
-        }
+      if(msg.bpm && msg.bpm > 0){
+        lastBPMs.push(msg.bpm);
       }
-      if(lastBPMs.length > 10) lastBPMs = lastBPMs.slice(lastBPMs.length - 10);
+      signalBaseline = -1;
+      signalRange = -1;
       updateBPMBar();
-      if(initSamples.length > 0){
-        document.getElementById("val").textContent = "data: " + initSamples[initSamples.length-1][1];
-      }
       needsRedraw = true;
-      /* Check URL param after init */
-      checkEventParam();
       return;
     }
 
     if(msg.type === "d"){
-      if(eventViewerMode) return; /* ignore live data in viewer mode */
-      var batch = msg.s;
-      var added = batch.length;
+      var ts = msg.ts;
+      var lo = msg.lo;
+      var bpm = msg.bpm;
+      var beats = msg.b;
+      var vals = msg.v;
+      var added = vals.length;
       for(var i = 0; i < added; i++){
-        samples.push(batch[i]);
-        if(batch[i][3] !== null && batch[i][3] !== undefined && batch[i][3] > 0){
-          lastBPMs.push(batch[i][3]);
+        var beatBpm = null;
+        for(var bi = 0; bi < beats.length; bi++){
+          if(beats[bi] === i){ beatBpm = bpm; break; }
+        }
+        samples.push([ts + i, vals[i], lo, beatBpm]);
+        if(beatBpm !== null && beatBpm > 0){
+          lastBPMs.push(beatBpm);
           if(lastBPMs.length > 10) lastBPMs.shift();
           updateBPMBar();
         }
       }
       if(added > 0){
-        document.getElementById("val").textContent = "data: " + batch[added-1][1];
+        document.getElementById("val").textContent = "data: " + vals[added - 1];
       }
       /* keep view at same position when scrolled back */
       if(!isLive) viewOffset += added;
       /* trim front */
-      if(samples.length > 50000){
-        var excess = samples.length - 50000;
+      if(samples.length > 10000){
+        var excess = samples.length - 10000;
         samples.splice(0, excess);
         viewOffset = Math.max(0, viewOffset - excess);
-        /* adjust marker indices */
-        for(var mi = arrhythmiaMarkers.length - 1; mi >= 0; mi--){
-          arrhythmiaMarkers[mi].sampleIdx -= excess;
-          if(arrhythmiaMarkers[mi].sampleIdx < 0) arrhythmiaMarkers.splice(mi, 1);
-        }
       }
       /* clamp */
       viewOffset = Math.min(viewOffset, Math.max(0, samples.length - totalVisibleSamples));
       if(isLive) needsRedraw = true;
-      return;
-    }
-
-    if(msg.type === "history_resp"){
-      if(!eventViewerMode){
-        samples = msg.samples.concat(samples);
-        if(samples.length > 50000) samples.splice(0, samples.length - 50000);
-        needsRedraw = true;
-      }
-      return;
-    }
-
-    if(msg.type === "arrhythmia_event"){
-      eventCount++;
-      document.getElementById("evbtn").textContent = "Events (" + eventCount + ")";
-      /* Place marker at current sample position */
-      arrhythmiaMarkers.push({
-        sampleIdx: samples.length - 1,
-        type: msg.event_type,
-        filename: msg.filename
-      });
-      needsRedraw = true;
       return;
     }
   };
