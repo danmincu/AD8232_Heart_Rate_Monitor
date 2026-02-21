@@ -85,7 +85,7 @@ Unidirectional MCU→host. ASCII newline-terminated: integer `0`–`1023` (ADC r
 - **BPM threshold**: Fixed `620.0` in Processing; adaptive (percentile-based Schmitt trigger) in ecg_server.py and Pico 2W — both use 80% of peak range from median as trigger, 30% as re-arm
 - **Serial port**: `Serial.list()[2]` in Processing; `--serial` flag or `ECG_SERIAL_PORT` env var for Python server
 - **Arrhythmia detection**: 30% R-R deviation, 10-beat baseline window, 5s cooldown between events (constants at top of `ecg_server.py`)
-- **Pico 2W pins**: ADC0=GP26, LO+=GP2, LO-=GP3, display on GP6-8/GP12-20
+- **Pico 2W pins**: ADC0=GP26, LO+=GP10, LO-=GP11, display on GP6-8/GP12-20
 - **Pico 2W WiFi**: Station mode — connects to hotspot configured via `WIFI_SSID`/`WIFI_PASSWORD` constants at top of `main.py`. HTTP server on port 80, max 2 SSE clients, ~20Hz broadcast.
 - **Pico 2W MicroPython constraints**: No asyncio, no standard library beyond `machine`/`time`/`sys`/`_thread`/`array`/`socket`/`network`/`hashlib`/`binascii`. Prefer integer math. Memory-constrained (~190KB heap, ~140KB free with WiFi active). `picographics` is from Pimoroni's custom firmware.
 

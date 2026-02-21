@@ -41,7 +41,13 @@ ARR_MIN_BEATS = 5               # minimum beats before detection activates
 ARR_BEATS_BEFORE = 15           # beats of context before event
 ARR_BEATS_AFTER = 15            # beats of context after event
 ARR_RETURN_BEATS = 3            # consecutive normal beats to confirm event end
+ARR_MIN_ANOMALOUS = 3           # minimum anomalous beats to save event (ignore isolated glitches)
 ARR_COOLDOWN_MS = 5000          # minimum gap between events
+
+# PVC detection (R-R interval based)
+PVC_DEVIATION_PCT = 0.40        # 40% R-R deviation = deviant beat
+PVC_MAX_STREAK = 2              # max consecutive deviant beats for PVC (>2 = arrhythmia)
+PVC_COOLDOWN_MS = 3000          # minimum gap between PVC markers
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -64,9 +70,8 @@ class ECGState:
         self.recent_values = deque(maxlen=5000)  # ~5 s of ADC values
         self.adaptive_threshold = BPM_THRESHOLD  # initial guess
         self.rearm_threshold = BPM_THRESHOLD     # hysteresis re-arm level
-        self.pvc_threshold = BPM_THRESHOLD       # opposite-direction PVC detect
-        self.pvc_rearm = BPM_THRESHOLD           # PVC re-arm level
-        self.pvc_armed = True                    # PVC detector armed
+        self.pvc_deviant_streak = 0              # consecutive deviant R-R intervals
+        self.pvc_last_ts = 0                     # timestamp of last PVC marker
         self.peaks_go_up = True                  # auto-detected polarity
         self.thresh_counter = 0                  # recompute every 500 samples
         # CSV
@@ -109,14 +114,10 @@ def _update_adaptive_threshold():
         state.peaks_go_up = True
         state.adaptive_threshold = p50 + 0.80 * range_up
         state.rearm_threshold = p50 + 0.30 * range_up
-        state.pvc_threshold = p50 - 0.15 * range_up
-        state.pvc_rearm = p50 - 0.05 * range_up
     else:
         state.peaks_go_up = False
         state.adaptive_threshold = p50 - 0.80 * range_down
         state.rearm_threshold = p50 - 0.30 * range_down
-        state.pvc_threshold = p50 + 0.15 * range_down
-        state.pvc_rearm = p50 + 0.05 * range_down
     log.debug(
         "Adaptive threshold: %.1f  rearm: %.1f  polarity=%s  p1=%d p50=%d p99=%d",
         state.adaptive_threshold, state.rearm_threshold,
@@ -169,12 +170,13 @@ def _check_arrhythmia(ts, rr_ms):
         else:
             state.beats_since_return += 1
             if state.beats_since_return >= ARR_RETURN_BEATS:
-                # Event confirmed — save it
-                _save_arrhythmia_event(ts, baseline)
+                # Event confirmed — only save if enough anomalous beats
+                if len(state.anomalous_beats) >= ARR_MIN_ANOMALOUS:
+                    _save_arrhythmia_event(ts, baseline)
+                    state.event_trigger_ts = ts
                 state.arrhythmia_state = "normal"
                 state.anomalous_beats = []
                 state.beats_since_return = 0
-                state.event_trigger_ts = ts
 
 
 def _save_arrhythmia_event(ts, baseline_rr):
@@ -277,6 +279,15 @@ def process_sample(raw_line: str):
     if raw_line == "!":
         value = 512
         leads_off = 1
+        # Reset detection state on leads-off transition
+        if state.last_beat_ms > 0:
+            state.last_beat_ms = 0
+            state.below_threshold = state.peaks_go_up
+            state.rr_intervals.clear()
+            state.arrhythmia_state = "normal"
+            state.anomalous_beats = []
+            state.beats_since_return = 0
+            state.pvc_deviant_streak = 0
     else:
         try:
             value = int(raw_line)
@@ -295,20 +306,9 @@ def process_sample(raw_line: str):
         if state.peaks_go_up:
             beat_detected = value > thresh and state.below_threshold
             reset_condition = value < state.rearm_threshold
-            pvc_hit = value < state.pvc_threshold and state.pvc_armed
-            pvc_reset = value > state.pvc_rearm
         else:
             beat_detected = value < thresh and not state.below_threshold
             reset_condition = value > state.rearm_threshold
-            pvc_hit = value > state.pvc_threshold and state.pvc_armed
-            pvc_reset = value < state.pvc_rearm
-
-        # PVC detection (opposite-direction spike — not counted as beat)
-        if pvc_hit:
-            state.pvc_armed = False
-            bpm = -1  # PVC marker
-        elif pvc_reset:
-            state.pvc_armed = True
 
         if beat_detected:
             if state.peaks_go_up:
@@ -326,9 +326,26 @@ def process_sample(raw_line: str):
                     if non_zero:
                         state.current_bpm = int(sum(non_zero) / len(non_zero))
                     bpm = int(instant)
+                    # R-R interval PVC detection
+                    pvc_flagged = False
+                    if len(state.rr_intervals) >= ARR_MIN_BEATS:
+                        bp = list(state.rr_intervals)[-ARR_BASELINE_WINDOW:]
+                        bl = statistics.median(bp)
+                        if bl > 0 and abs(diff - bl) / bl > PVC_DEVIATION_PCT:
+                            state.pvc_deviant_streak += 1
+                        else:
+                            if 1 <= state.pvc_deviant_streak <= PVC_MAX_STREAK:
+                                if ts - state.pvc_last_ts > PVC_COOLDOWN_MS:
+                                    bpm = -1
+                                    pvc_flagged = True
+                                    state.pvc_last_ts = ts
+                            state.pvc_deviant_streak = 0
+                    else:
+                        state.pvc_deviant_streak = 0
                     state.beat_sample_indices.append(state.total_samples_appended)
-                    state.rr_intervals.append(diff)
-                    _check_arrhythmia(ts, diff)
+                    if not pvc_flagged:
+                        state.rr_intervals.append(diff)
+                        _check_arrhythmia(ts, diff)
             state.last_beat_ms = ts
         elif reset_condition:
             # Only re-arm after refractory period to prevent T-wave false triggers

@@ -21,8 +21,8 @@ Serial protocol (unchanged — compatible with ecg_server.py):
 
 Wiring:
     AD8232 OUTPUT  ->  GP26 (ADC0, pin 31)
-    AD8232 LO+     ->  GP2  (pin 4)    — leads-off detection +
-    AD8232 LO-     ->  GP3  (pin 5)    — leads-off detection -
+    AD8232 LO+     ->  GP10 (pin 14)   — leads-off detection +
+    AD8232 LO-     ->  GP11 (pin 15)   — leads-off detection -
     AD8232 3.3V    ->  3V3(OUT) (pin 36)
     AD8232 GND     ->  GND (pin 38)
 
@@ -59,8 +59,8 @@ SERIAL_PRINT_EVERY = 1       # print every Nth sample (0 = disable serial ADC ou
 # ---------------------------------------------------------------------------
 
 adc = ADC(Pin(26))
-lo_plus = Pin(2, Pin.IN, Pin.PULL_DOWN)
-lo_minus = Pin(3, Pin.IN, Pin.PULL_DOWN)
+lo_plus = Pin(10, Pin.IN, Pin.PULL_DOWN)
+lo_minus = Pin(11, Pin.IN, Pin.PULL_DOWN)
 
 # ---------------------------------------------------------------------------
 # Shared state — written by Core 0, read by Core 1
@@ -91,6 +91,7 @@ WHITE = display.create_pen(255, 255, 255)
 RED = display.create_pen(255, 0, 0)
 GREEN = display.create_pen(0, 200, 0)
 YELLOW = display.create_pen(255, 200, 0)
+BLUE = display.create_pen(0, 0, 255)
 GREY = display.create_pen(50, 50, 50)
 
 DEAD_TOP = 14
@@ -122,12 +123,12 @@ thresh_recompute_every = 500
 thresh_counter = 0
 adaptive_threshold = 620
 rearm_threshold = 620
-pvc_threshold = 620
-pvc_rearm = 620
 peaks_go_up = True
 
 below_threshold = True
-pvc_armed = True
+rr_history = []
+pvc_deviant_streak = 0
+pvc_last_ts = 0
 last_beat_ms = 0
 last_beat_rearm_ms = 0
 REFRACTORY_MS = 350
@@ -137,7 +138,6 @@ _bpm = 0
 
 def _recompute_threshold():
     global adaptive_threshold, rearm_threshold, peaks_go_up
-    global pvc_threshold, pvc_rearm
     n = min(thresh_fill, THRESH_BUF_SIZE)
     if n < 100:
         return
@@ -151,20 +151,16 @@ def _recompute_threshold():
         peaks_go_up = True
         adaptive_threshold = p50 + int(0.80 * range_up)
         rearm_threshold = p50 + int(0.30 * range_up)
-        pvc_threshold = p50 - int(0.15 * range_up)
-        pvc_rearm = p50 - int(0.05 * range_up)
     else:
         peaks_go_up = False
         adaptive_threshold = p50 - int(0.80 * range_down)
         rearm_threshold = p50 - int(0.30 * range_down)
-        pvc_threshold = p50 + int(0.15 * range_down)
-        pvc_rearm = p50 + int(0.05 * range_down)
 
 
 def _detect_beat(value, ts, buf_idx):
     global below_threshold, last_beat_ms, last_beat_rearm_ms, _bpm
     global thresh_idx, thresh_fill, thresh_counter, current_bpm
-    global pvc_armed, pvc_event_flag, pvc_event_ts
+    global pvc_deviant_streak, pvc_last_ts, pvc_event_flag, pvc_event_ts
 
     thresh_buf[thresh_idx] = value
     thresh_idx = (thresh_idx + 1) % THRESH_BUF_SIZE
@@ -179,20 +175,9 @@ def _detect_beat(value, ts, buf_idx):
     if peaks_go_up:
         beat_hit = value > thr and below_threshold
         reset_cond = value < rearm_threshold
-        pvc_hit = value < pvc_threshold and pvc_armed
-        pvc_reset_cond = value > pvc_rearm
     else:
         beat_hit = value < thr and not below_threshold
         reset_cond = value > rearm_threshold
-        pvc_hit = value > pvc_threshold and pvc_armed
-        pvc_reset_cond = value < pvc_rearm
-
-    if pvc_hit:
-        pvc_armed = False
-        pvc_event_flag = True
-        pvc_event_ts = ts
-    elif pvc_reset_cond:
-        pvc_armed = True
 
     if beat_hit:
         below_threshold = not peaks_go_up
@@ -205,6 +190,26 @@ def _detect_beat(value, ts, buf_idx):
                 if len(recent_bpms) > 10:
                     recent_bpms.pop(0)
                 current_bpm = sum(recent_bpms) // len(recent_bpms)
+                # R-R interval PVC detection (integer math)
+                if len(rr_history) >= 5:
+                    s = sorted(rr_history)
+                    bl = s[len(s) // 2]
+                    if bl > 0:
+                        dev = abs(diff - bl) * 100 // bl
+                        if dev > 40:
+                            pvc_deviant_streak += 1
+                        else:
+                            if 1 <= pvc_deviant_streak <= 2:
+                                if time.ticks_diff(ts, pvc_last_ts) > 3000:
+                                    pvc_event_flag = True
+                                    pvc_event_ts = ts
+                                    pvc_last_ts = ts
+                            pvc_deviant_streak = 0
+                else:
+                    pvc_deviant_streak = 0
+                rr_history.append(diff)
+                if len(rr_history) > 10:
+                    rr_history.pop(0)
         last_beat_ms = ts
         if len(beat_broadcast_idxs) < 10:
             beat_broadcast_idxs.append(buf_idx)
@@ -247,7 +252,7 @@ def _draw_waveform(x0, y0, w, h, widx):
             return y0 + h
         return py
 
-    display.set_pen(RED)
+    display.set_pen(BLUE if leads_off_flag else RED)
 
     v0 = wave_buf[widx % WAVE_LEN]
     gmin = v0

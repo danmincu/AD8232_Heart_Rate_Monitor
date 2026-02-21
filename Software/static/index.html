@@ -381,6 +381,7 @@ function render(){
 requestAnimationFrame(render);
 
 /* ---- minimap rendering ---- */
+var MINIMAP_SCREENS = 4;       // show at most 4 screens of data in minimap
 function drawMinimap(){
   var w = canvas.width;
   var mmTop = traceH + MINIMAP_GAP;
@@ -398,11 +399,16 @@ function drawMinimap(){
 
   if(n < 2) return;
 
-  /* compute baseline/range for minimap from full buffer */
+  /* limit minimap to most recent MINIMAP_SCREENS screens */
+  var mmMaxSamples = totalVisibleSamples * MINIMAP_SCREENS;
+  var mmStart = Math.max(0, n - mmMaxSamples);
+  var mmCount = n - mmStart;
+
+  /* compute baseline/range for minimap from visible window */
   var mmMin = 99999, mmMax = -99999;
   /* sample every Nth value for speed */
-  var step = Math.max(1, Math.floor(n / (w * 2)));
-  for(var i = 0; i < n; i += step){
+  var step = Math.max(1, Math.floor(mmCount / (w * 2)));
+  for(var i = mmStart; i < n; i += step){
     var v = samples[i][1];
     if(v < mmMin) mmMin = v;
     if(v > mmMax) mmMax = v;
@@ -414,11 +420,11 @@ function drawMinimap(){
   ctx.strokeStyle = "rgba(233,69,96,0.7)";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  var samplesPerPx = n / w;
+  var samplesPerPx = mmCount / w;
   var drawn = false;
   for(var px = 0; px < w; px++){
-    var s0 = Math.floor(px * samplesPerPx);
-    var s1 = Math.min(n - 1, Math.floor((px + 1) * samplesPerPx));
+    var s0 = mmStart + Math.floor(px * samplesPerPx);
+    var s1 = Math.min(n - 1, mmStart + Math.floor((px + 1) * samplesPerPx));
     var pmin = 99999, pmax = -99999;
     /* sample a few points within the range for speed */
     var pstep = Math.max(1, Math.floor((s1 - s0) / 4));
@@ -445,11 +451,11 @@ function drawMinimap(){
   }
   if(drawn) ctx.stroke();
 
-  /* viewport indicator */
+  /* viewport indicator (relative to minimap window) */
   var endIdx = Math.max(1, n - viewOffset);
   var startIdx = Math.max(0, endIdx - totalVisibleSamples);
-  var vpX1 = Math.round(startIdx / n * w);
-  var vpX2 = Math.round(endIdx / n * w);
+  var vpX1 = Math.round(Math.max(0, startIdx - mmStart) / mmCount * w);
+  var vpX2 = Math.round(Math.max(0, endIdx - mmStart) / mmCount * w);
   var vpW = Math.max(vpX2 - vpX1, 4);
 
   ctx.fillStyle = "rgba(233,69,96,0.25)";
@@ -470,9 +476,12 @@ function minimapJump(clientX){
   var n = samples.length;
   if(n < 2) return;
 
-  /* Map click position to center of viewport at that position */
+  /* Map click position within the minimap window (last MINIMAP_SCREENS screens) */
+  var mmMaxSamples = totalVisibleSamples * MINIMAP_SCREENS;
+  var mmStart = Math.max(0, n - mmMaxSamples);
+  var mmCount = n - mmStart;
   var frac = x / canvas.width;
-  var centerSample = Math.round(frac * n);
+  var centerSample = mmStart + Math.round(frac * mmCount);
   var halfVisible = Math.floor(totalVisibleSamples / 2);
   var newEnd = centerSample + halfVisible;
   var newOffset = n - newEnd;
