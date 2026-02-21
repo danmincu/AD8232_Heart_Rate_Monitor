@@ -52,7 +52,7 @@ WIFI_SSID = "danix"
 WIFI_PASSWORD = "12345678"
 WEB_PORT = 80
 MAX_SSE_CLIENTS = 2
-SERIAL_PRINT_EVERY = 10      # print every Nth sample (0 = disable serial ADC output)
+SERIAL_PRINT_EVERY = 1       # print every Nth sample (0 = disable serial ADC output)
 
 # ---------------------------------------------------------------------------
 # Pin configuration

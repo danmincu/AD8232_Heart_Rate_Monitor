@@ -43,18 +43,15 @@ Global mutable state lives in the `ECGState` singleton (`state`). The beat detec
 WebSocket message types (server→client): `init` (config + recent samples + BPM on connect), `d` (data batch at 60Hz), `history_resp` (response to scroll-back request), `arrhythmia_event` (real-time alert with event_type + filename). Client→server: `history` (request older samples by start index + count).
 
 ### 4. Pico 2W MicroPython display + WiFi web server (`pico2w-display/`)
-Runs on Raspberry Pi Pico 2W with Pimoroni Pico Display. Dual-core via `_thread`:
-- **Core 0** (`main()`): WiFi AP init (one-time, blocking) + ADC read + serial output at ~1kHz (same protocol as Arduino). Writes to `wave_buf` ring buffer. Must stay lean — no allocations, no display calls.
-- **Core 1** (`display_thread()` → `asyncio.run()`): Runs asyncio event loop with three concurrent tasks:
-  - `_display_task()`: Reads `wave_buf`, runs BPM detection + display rendering at ~5Hz. Owns all display/PicoGraphics objects.
-  - `_handle_client()`: HTTP server on port 80 — serves `index.html` from flash, handles WebSocket upgrades.
-  - `_ws_broadcast_task()`: Broadcasts new ECG samples to connected WebSocket clients at ~20Hz.
+Runs on Raspberry Pi Pico 2W with Pimoroni Pico Display. Dual-core via `_thread`. No asyncio — uses raw sockets for maximum compatibility with all MicroPython builds.
+- **Core 0** (`main()`): WiFi STA init (one-time, blocking) + ADC read at ~1kHz + serial output (every Nth sample, configurable) + non-blocking HTTP server poll + SSE broadcast every ~50ms. Writes to `wave_buf` ring buffer.
+- **Core 1** (`display_thread()`): BPM detection + display rendering at ~5Hz. Owns all display/PicoGraphics objects. No networking, no asyncio.
 
-WiFi Access Point: SSID `ECG-Monitor`, password `ecg12345`, WPA2. Phone connects and opens `http://192.168.4.1`. Max 2 concurrent WebSocket clients.
+WiFi Station mode: connects to a configurable hotspot (constants `WIFI_SSID`/`WIFI_PASSWORD` at top of `main.py`). Device gets a DHCP-assigned IP; open `http://<ip>` from any device on the same network. Max 2 concurrent SSE clients.
 
-Web UI (`pico2w-display/index.html`): Stripped-down version of `Software/static/index.html` — same canvas ECG rendering (grid, multi-row trace, minimap, scroll/zoom, BPM labels) but without events panel, event viewer, recording, arrhythmia markers, or history requests. Uses a compact WebSocket protocol: `init` message has `{type, bpm, buf}`, data messages have `{type, ts, lo, bpm, b[], v[]}` where `v` is raw ADC values and `b` is beat offset indices.
+Web UI (`pico2w-display/index.html`): Stripped-down version of `Software/static/index.html` — same canvas ECG rendering (grid, multi-row trace, minimap, scroll/zoom, BPM labels) but without events panel, event viewer, recording, arrhythmia markers, or history requests. Uses SSE (Server-Sent Events) via `EventSource("/events")`. SSE message format: `init` has `{type, bpm, buf}`, data messages have `{type, ts, lo, bpm, b[], v[]}` where `v` is raw ADC values and `b` is beat offset indices.
 
-Cross-core contract: Core 0 writes `wave_buf`, `wave_idx`, `current_value`, `leads_off_flag`. Core 1 reads these. No locks — relies on atomic scalar writes and tolerates occasional torn reads.
+Cross-core contract: Core 0 writes `wave_buf`, `wave_idx`, `current_value`, `current_bpm`, `leads_off_flag`. Core 1 reads these (and Core 1 writes `current_bpm` from BPM detection). No locks — relies on atomic scalar writes and tolerates occasional torn reads.
 
 Wiring: AD8232 OUTPUT→GP26, LO+→GP2, LO-→GP3. Button A cycles display pages, Button B toggles backlight. PVC detection is display-flash only (no file I/O).
 
@@ -89,8 +86,8 @@ Unidirectional MCU→host. ASCII newline-terminated: integer `0`–`1023` (ADC r
 - **Serial port**: `Serial.list()[2]` in Processing; `--serial` flag or `ECG_SERIAL_PORT` env var for Python server
 - **Arrhythmia detection**: 30% R-R deviation, 10-beat baseline window, 5s cooldown between events (constants at top of `ecg_server.py`)
 - **Pico 2W pins**: ADC0=GP26, LO+=GP2, LO-=GP3, display on GP6-8/GP12-20
-- **Pico 2W WiFi AP**: SSID `ECG-Monitor`, password `ecg12345`, WPA2 (security=4). Constants at top of `main.py`. Web server on port 80, max 2 WebSocket clients, 20Hz broadcast.
-- **Pico 2W MicroPython constraints**: No standard library beyond `machine`/`time`/`sys`/`_thread`/`array`/`asyncio`/`network`/`hashlib`/`binascii`. Prefer integer math. Memory-constrained (~190KB heap, ~140KB free with WiFi active). `picographics` is from Pimoroni's custom firmware.
+- **Pico 2W WiFi**: Station mode — connects to hotspot configured via `WIFI_SSID`/`WIFI_PASSWORD` constants at top of `main.py`. HTTP server on port 80, max 2 SSE clients, ~20Hz broadcast.
+- **Pico 2W MicroPython constraints**: No asyncio, no standard library beyond `machine`/`time`/`sys`/`_thread`/`array`/`socket`/`network`/`hashlib`/`binascii`. Prefer integer math. Memory-constrained (~190KB heap, ~140KB free with WiFi active). `picographics` is from Pimoroni's custom firmware.
 
 ## Data Storage Formats
 
