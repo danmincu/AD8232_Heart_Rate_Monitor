@@ -565,48 +565,78 @@ def main():
     global current_value, leads_off_flag, wave_idx
 
     # ---- WiFi STA setup — connect to phone hotspot ----
+    # CYW43 DHCP is unreliable (known bug: gets stuck at status 2 = NOIP).
+    # Workaround: retry with full deinit between attempts, disable power mgmt.
     global _wlan
     wifi_ok = False
     wifi_ip = "0.0.0.0"
-    try:
-        import network
-        wlan = network.WLAN(network.STA_IF)
-        wlan.active(True)
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        sys.stdout.write("Connecting to %s...\n" % WIFI_SSID)
+    WIFI_MAX_ATTEMPTS = 5
+    WIFI_TIMEOUT_S = 10
 
-        # Show connecting status on display
-        display.set_pen(BLACK)
-        display.clear()
-        display.set_pen(RED)
-        display.text("AD8232 ECG", 30, DEAD_TOP + 10, scale=3)
-        display.set_pen(YELLOW)
-        display.text("WiFi: " + WIFI_SSID, 10, DEAD_TOP + 46, scale=2)
-        display.set_pen(WHITE)
-        display.text("Connecting...", 30, DEAD_TOP + 72, scale=2)
-        display.update()
+    import network
 
-        for attempt in range(30):
+    # Show connecting status on display
+    display.set_pen(BLACK)
+    display.clear()
+    display.set_pen(RED)
+    display.text("AD8232 ECG", 30, DEAD_TOP + 10, scale=3)
+    display.set_pen(YELLOW)
+    display.text("WiFi: " + WIFI_SSID, 10, DEAD_TOP + 46, scale=2)
+    display.set_pen(WHITE)
+    display.text("Connecting...", 30, DEAD_TOP + 72, scale=2)
+    display.update()
+
+    wlan = None
+    for attempt in range(WIFI_MAX_ATTEMPTS):
+        try:
+            # Full reset of WiFi chip between attempts
+            if wlan is not None:
+                try:
+                    wlan.disconnect()
+                    time.sleep_ms(100)
+                    wlan.active(False)
+                    time.sleep_ms(100)
+                    wlan.deinit()
+                    time.sleep_ms(500)
+                except Exception:
+                    pass
+
+            wlan = network.WLAN(network.STA_IF)
+            wlan.active(True)
+            time.sleep_ms(200)
+            wlan.config(pm=0xa11140)  # disable power management — fixes DHCP
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            sys.stdout.write("WiFi attempt %d/%d...\n" % (attempt + 1, WIFI_MAX_ATTEMPTS))
+
+            for tick in range(WIFI_TIMEOUT_S * 2):
+                if wlan.isconnected():
+                    break
+                time.sleep_ms(500)
+                # Update display
+                display.set_pen(BLACK)
+                display.rectangle(30, DEAD_TOP + 72, 200, 20)
+                display.set_pen(WHITE)
+                msg = "Attempt %d" % (attempt + 1) + "." * ((tick % 3) + 1)
+                display.text(msg, 30, DEAD_TOP + 72, scale=2)
+                display.update()
+
             if wlan.isconnected():
-                break
-            time.sleep(1)
-            # Update dots on display
-            display.set_pen(BLACK)
-            display.rectangle(30, DEAD_TOP + 72, 200, 20)
-            display.set_pen(WHITE)
-            display.text("Connecting" + "." * ((attempt % 3) + 1), 30, DEAD_TOP + 72, scale=2)
-            display.update()
-        wifi_ok = wlan.isconnected()
-        if wifi_ok:
-            ifc = wlan.ifconfig()
-            wifi_ip = ifc[0]
-            sys.stdout.write("Connected! IP: %s\n" % wifi_ip)
-            _wlan = wlan  # prevent GC
-        else:
-            sys.stdout.write("WiFi FAILED status: %d\n" % wlan.status())
-    except Exception as e:
-        sys.stdout.write("WiFi err: %s\n" % str(e))
-        wifi_ok = False
+                ifc = wlan.ifconfig()
+                wifi_ip = ifc[0]
+                if wifi_ip != "0.0.0.0":
+                    wifi_ok = True
+                    sys.stdout.write("Connected! IP: %s (attempt %d)\n" % (wifi_ip, attempt + 1))
+                    _wlan = wlan  # prevent GC
+                    break
+                else:
+                    sys.stdout.write("Associated but no IP — retrying\n")
+            else:
+                sys.stdout.write("WiFi attempt %d failed, status: %d\n" % (attempt + 1, wlan.status()))
+        except Exception as e:
+            sys.stdout.write("WiFi err: %s\n" % str(e))
+
+    if not wifi_ok:
+        sys.stdout.write("WiFi FAILED after %d attempts\n" % WIFI_MAX_ATTEMPTS)
 
     # Splash screen
     display.set_pen(BLACK)
